@@ -57,7 +57,7 @@ def validate_csv_data(df: pd.DataFrame, metric_name: str, unique_id: str) -> pd.
         raise ValueError(f"Required columns {missing_cols} not found in CSV.\n"
                         f"Available columns: {list(df.columns)}\n"
                         f"Please ensure your CSV contains '{unique_id}' and '{metric_name}' columns.")
-    
+
     # Check for year column (optional)
     has_year = "year" in df.columns
     if has_year:
@@ -70,14 +70,14 @@ def validate_csv_data(df: pd.DataFrame, metric_name: str, unique_id: str) -> pd.
         df["year"] = df["year"].astype(int)
     else:
         print(f"No year column found - will perform single-time aggregation")
-    
+
     # Check for missing values in required columns
     for col in required_cols:
         missing_count = df[col].isna().sum()
         if missing_count > 0:
             print(f"Warning: {missing_count} missing values in '{col}' column - these rows will be excluded")
             df = df.dropna(subset=[col])
-    
+
     # Validate metric column is numeric
     if not pd.api.types.is_numeric_dtype(df[metric_name]):
         try:
@@ -88,7 +88,7 @@ def validate_csv_data(df: pd.DataFrame, metric_name: str, unique_id: str) -> pd.
                 df = df.dropna(subset=[metric_name])
         except:
             raise ValueError(f"Column '{metric_name}' contains non-numeric data that cannot be converted")
-    
+
     print(f"Validation complete: {len(df)} valid records")
     return df
 
@@ -147,31 +147,34 @@ def pivot_year(df: pd.DataFrame, metric_name: str, unique_id: str = "UID") -> pd
 
 
 def aggregate_measure_weighted(
-    df: pd.DataFrame, 
-    aggregator: pd.DataFrame, 
-    boundary_fields: List[str], 
+    df: pd.DataFrame,
+    aggregator: pd.DataFrame,
+    boundary_fields: List[str],
     measure_field: str,
     functional_groups: Optional[List[str]] = None,
-    is_base_scale: bool = False
+    metric_columns: List[str] = None,
+    aggregation_method: str = "geometry",
+    is_base_scale: bool = False,
 ) -> pd.DataFrame:
     """
     Aggregate ecological data across spatial scales using appropriate weighting methods.
-    
+
     This is the core aggregation function that scales up ecological metrics from
     fine-scale units (sites, patches, segments) to larger management units
     (wetland complexes, valleys, basins) using ecologically appropriate weighting.
-    
+
     Ecological Examples:
         - Vegetation NDVI: Area-weighted mean across habitat patches → valley condition
-        - Stream health: Length-weighted mean across river segments → catchment health  
+        - Stream health: Length-weighted mean across river segments → catchment health
         - Species counts: Sum across monitoring sites → regional abundance
         - Habitat patches: Count of patches → landscape fragmentation metric
-    
+
     Weighting Logic:
         - Points: Equal weighting (count=1) or sum of attribute values
+        - all:  frequency of occurrence within the aggregation boundary
         - Lines: Length-weighted for metrics affected by stream/corridor extent
         - Polygons: Area-weighted for metrics affected by habitat/patch size
-    
+
     Args:
         df: Parameter values per base scale unit (sites, patches, segments)
         aggregator: Aggregator spatial units (complexes, valleys) or None for base scale
@@ -179,49 +182,198 @@ def aggregate_measure_weighted(
         measure_field: Field containing area/length/count for weighting
         functional_groups: Additional grouping fields (e.g., ["HabitatType"])
         is_base_scale: True if this is the base scale (no spatial aggregation)
-        
+
     Returns:
         Measure-weighted aggregated values with ecological meaning preserved
     """
     if functional_groups is None:
         functional_groups = []
-    
+    print(f"Functional groups: {functional_groups}")
+
+    if metric_columns is None:
+        metric_columns = (
+            df.select_dtypes(include=[np.number])
+            .columns.difference([measure_field])
+            .tolist()
+        )
+    print(f"metric_columns : {metric_columns}")
+
+    grouping_columns = boundary_fields + functional_groups
+    print(f"grouping_columns : {grouping_columns}")
+
+    # Ensure aggregator is valid before accessing columns
+    if aggregation_method not in ["geometry", "count", "sum", "frequency"]:
+        raise ValueError(
+            f"Invalid aggregation method: {aggregation_method}\n"
+            f"Supported methods: 'geometry', 'count', 'sum', 'frequency'"
+        )
+
+    if aggregation_method == "count":
+        # Count aggregation - a simple count of features within the aggregation boundary
+        # This counts how many base units contribute to each aggregation boundary
+        # Group by aggregation boundaries and count base units
+        return aggregator.groupby(grouping_columns).size().to_frame(name="count")
+
+    joined_data = df.join(aggregator, how="inner").replace([np.inf, -np.inf], np.nan)
+    print(f"Aggregating {len(joined_data)} records across {len(aggregator)} boundaries")
+
+    # -----------------------------------------------------------------
+    # Sum aggregation
+    # -----------------------------------------------------------------
+
+    # Sum aggregation - sums attribute values across aggregation boundaries
+    # This is used when the attribute values themselves are meaningful
+    # E.g., total species abundance, carbon storage, management costs
+    # It does not consider the size of the features, just their values
+
+    if aggregation_method == "sum":
+        # Group by aggregation boundaries and sum base unit values
+        # This sums the base unit values for each aggregation boundary
+        aggregated_results = (
+            joined_data[metric_columns + grouping_columns]
+            .groupby(grouping_columns)[metric_columns]
+            .sum(numeric_only=True)
+        )
+
+    elif aggregation_method == "frequency":
+
+        # -----------------------------------------------------------------
+        # Frequency Aggregation
+        # -----------------------------------------------------------------
+
+        if not functional_groups:
+            raise ValueError(
+                "Frequency weighting requires functional_groups to define subgroups within boundaries."
+            )
+
+        # Step 1: Frequency counts per boundary–group
+        frequency_counts = joined_data.groupby(grouping_columns).size().rename("freq")
+
+        # Step 2: Total counts per boundary
+        total_counts = frequency_counts.groupby(boundary_fields).sum().rename("total")
+
+        # Step 3: Join to get frequency weights
+        frequency_weights = frequency_counts.to_frame().join(
+            total_counts, on=boundary_fields
+        )
+        frequency_weights["weight"] = (
+            frequency_weights["freq"] / frequency_weights["total"]
+        )
+
+        # Step 4: Join weights back to the data
+        joined_data = joined_data.join(frequency_weights["weight"], on=grouping_columns)
+
+        # Step 5: Apply weights to metrics
+        weighted_metrics = joined_data[metric_columns].multiply(
+            joined_data["weight"], axis=0
+        )
+
+        # Step 6: Aggregate weighted metrics to boundary
+        aggregated_results = weighted_metrics.groupby(boundary_fields).sum()
+
+    else:
+        # -----------------------------------------------------------------
+        # Geometry Aggregation
+        # -----------------------------------------------------------------
+
+        # Geometry aggregation - gives more weight to larger features and requires a measure field
+        # to quantity the area/length of each base unit contributing to the aggregation
+
+        # Weighting is achieved by multiplying metrics by area/length/count
+        # This ensures larger features contribute more to landscape metrics
+        # than smaller patches, preserving ecological meaning
+        if measure_field not in joined_data.columns:
+            raise ValueError(
+                f"Measure field '{measure_field}' not found in joined data.\n"
+                f"Available columns: {list(joined_data.columns)}\n"
+                f"Please ensure the measure field is correctly specified."
+            )
+        joined_data[metric_columns] = joined_data[metric_columns].multiply(
+            joined_data[measure_field], axis=0
+        )
+        # print ( joined_data[metric_columns])
+        # Group by aggregation boundaries and sum weighted values
+        # Sums both the weighted metrics and the measures (total area/length/count)
+        aggregated_results = (
+            joined_data[metric_columns + [measure_field] + grouping_columns]
+            .groupby(grouping_columns)
+            .sum(numeric_only=True)
+        )
+        # Normalize by total measure to get proper weighted averages
+        # Converts weighted sums back to meaningful ecological units
+        # E.g., (sum of area*NDVI) / (total area) = area-weighted mean NDVI
+        aggregated_results[metric_columns] = aggregated_results[metric_columns].div(
+            aggregated_results[measure_field], axis=0
+        )
+    if aggregation_method in ["sum", "geometry", "frequency"]:
+        return aggregated_results[
+            metric_columns
+            + ([measure_field] if measure_field in aggregated_results.columns else [])
+        ]
+    elif aggregation_method == "count":
+        return aggregated_results
+
+
+def aggregate_count(
+    df: pd.DataFrame,
+    aggregator: pd.DataFrame,
+    boundary_fields: List[str],
+    functional_groups: Optional[List[str]] = None,
+    is_base_scale: bool = False,
+) -> pd.DataFrame:
+    """
+    Aggregate ecological data across spatial scales using a simple count.
+
+    This is the core aggregation function that scales up ecological metrics from
+    fine-scale units (sites, patches, segments) to larger management units
+    (wetland complexes, valleys, basins) using a simple count of base units.
+
+    Ecological Examples:
+        - Habitat patches: Count of patches → landscape fragmentation metric
+        - Monitoring sites: Count of sites → regional abundance
+
+    Args:
+        df: Parameter values per base scale unit (sites, patches, segments)
+        aggregator: Aggregator spatial units (complexes, valleys) or None for base scale
+        boundary_fields: Fields to group by for aggregation (e.g., ["ValleyName"])
+        functional_groups: Additional grouping fields (e.g., ["HabitatType"])
+        is_base_scale: True if this is the base scale (no spatial aggregation)
+
+    Returns:
+        Count of base units aggregated across aggregation boundaries
+    """
+    if functional_groups is None:
+        functional_groups = []
+
     # Ensure df is valid before accessing columns
     if df is None or df.empty:
         raise ValueError("Input DataFrame is None or empty")
-        
+
     metric_columns = df.select_dtypes(include=[np.number]).columns.values.tolist()
-    
+
     grouping_columns = boundary_fields + functional_groups
-    
+
     # # Base scale - no spatial aggregation, just group by functional types
     # # Used for base-level analysis (e.g., NDVI by habitat type within sites)
     if is_base_scale:
         # grp column already exists from base scale loading (GROUP_RULES applied)
-        #numeric_cols = joined_data.select_dtypes(include=[np.number]).columns.tolist()
-        #return joined_data[metric_columns + [measure_field] + grouping_columns].set_index(grouping_columns, append=True)
+        # numeric_cols = joined_data.select_dtypes(include=[np.number]).columns.tolist()
+        # return joined_data[metric_columns + [measure_field] + grouping_columns].set_index(grouping_columns, append=True)
         return joined_data
-    
-        
+
     print(f"Aggregating {len(df)} records across {len(aggregator)} boundaries")
 
     joined_data = df.join(aggregator, how="inner").replace([np.inf, -np.inf], np.nan)
-    # Apply measure weighting - multiply metrics by area/length/count
-    # This weights each base unit's contribution by its ecological "importance"
-    # Large habitats contribute more to landscape metrics than small patches
-    joined_data[metric_columns] = joined_data[metric_columns].multiply(joined_data[measure_field], axis=0)
-    #print ( joined_data[metric_columns])
     # Group by aggregation boundaries and sum weighted values
     # Sums both the weighted metrics and the measures (total area/length/count)
-    aggregated_results = joined_data[metric_columns + [measure_field] + grouping_columns].groupby(grouping_columns).sum(numeric_only=True)
-    #print(aggregated_results)
-    
-    # Normalize by total measure to get proper weighted averages
-    # Converts weighted sums back to meaningful ecological units
-    # E.g., (sum of area*NDVI) / (total area) = area-weighted mean NDVI
-    aggregated_results[metric_columns] = aggregated_results[metric_columns].div(aggregated_results[measure_field], axis=0)
-    
-    return aggregated_results[metric_columns + [measure_field]]
+    aggregated_results = (
+        joined_data[metric_columns + grouping_columns]
+        .groupby(grouping_columns)
+        .count(numeric_only=True)
+    )
+    # print(aggregated_results)
+
+    return aggregated_results[metric_columns]
 
 
 def standardise_z(df: pd.DataFrame) -> pd.DataFrame:
@@ -274,19 +426,18 @@ class SpatialScale:
     - "Aggregation scales" contain larger boundaries
     - You create these through the config.py settings
     """
-    
+
     def __init__(
-        self, 
-        name: str, 
-        source: Union[str, Path], 
-        unique_id_field: Union[str, List[str]], 
+        self,
+        name: str,
+        source: Union[str, Path],
+        unique_id_field: Union[str, List[str]],
         measure_field: Optional[str] = None,
         measure_multiplier: Optional[float] = None,
-        years: Optional[str] = None,
         type_field: Optional[str] = None,
         aggregation_method: str = "geometry",
         extra_columns: Optional[List[str]] = None,
-        is_base_scale: bool = False
+        is_base_scale: bool = False,
     ):
         """
         Create a new spatial scale for analysis.
@@ -311,16 +462,16 @@ class SpatialScale:
         self.name = name
         self.source = Path(source)
         self.is_base_scale = is_base_scale
-        
+
         # Check that the shapefile actually exists
         if not self.source.exists():
             raise FileNotFoundError(f"Cannot find shapefile: {source}\n"
                                   f"Please check that the file exists and the path is correct.")
-        
+
         # Convert unique_id_field to a list format (technical requirement)
         # This allows for compound keys if needed (multiple columns)
         self.unique_id = [unique_id_field] if isinstance(unique_id_field, str) else unique_id_field
-        
+
         # Build list of columns to load from the shapefile
         # Only load what we need to make processing faster
         cols = self.unique_id.copy()  # Always need the ID field
@@ -330,12 +481,12 @@ class SpatialScale:
             cols.append(type_field)       # Feature types for grouping
         if extra_columns:
             cols.extend([c for c in extra_columns if c not in cols])  # Any additional fields
-        
+
         # Load the shapefile and convert to standard coordinate system
         # This ensures all spatial calculations are accurate
         print(f"Loading {name} data from {self.source.name}...")
         self.data = gpd.read_file(self.source, columns=cols).to_crs(DEFAULT_CRS)
-        
+
         # Handle complex geometries by breaking them into simple parts
         # E.g., a MultiPolygon becomes multiple separate Polygons
         # This ensures each feature is treated as a separate unit for analysis
@@ -343,16 +494,16 @@ class SpatialScale:
         if multi_geom_count > 0:
             print(f"  Breaking {multi_geom_count} complex geometries into simple parts...")
             self.data = self.data.explode(index_parts=False).reset_index(drop=True)
-            
+
         self.data = validate_geometries(self.data)
-        
+
         # Check that all required columns exist in the shapefile
         missing_cols = [c for c in cols if c not in self.data.columns]
         if missing_cols:
             raise ValueError(f"Required columns {missing_cols} not found in {source}\n"
                            f"Available columns: {list(self.data.columns)}\n"
                            f"Please check your column names in config.py")
-        
+
         # Automatically detect what type of geometry this shapefile contains
         # This determines how we calculate measures and perform aggregation
         first_geom = self.data.geometry.iloc[0]
@@ -362,11 +513,16 @@ class SpatialScale:
             geometry_type = "line"       # Linear features (rivers, transects, corridors)
         elif first_geom.geom_type == 'Point':
             geometry_type = "point"      # Point locations (monitoring sites, observations)
+            if aggregation_method not in ["count", "sum"]:
+                print(
+                    f"  WARNING: Point data detected. Setting aggregation method to 'count'."
+                )
+                aggregation_method = "count"
         else:
             raise ValueError(f"Unsupported geometry type: {first_geom.geom_type}")
-        
+
         print(f"  Detected geometry type: {geometry_type} ({len(self.data)} features)")
-        
+
         # Calculate appropriate measure based on aggregation method and geometry
         # This determines how ecological features are weighted in aggregation
         if not measure_field:
@@ -389,7 +545,7 @@ class SpatialScale:
                 measure_field = "Area_Ha"
             elif geometry_type == "line":
                 # Length-weighted aggregation for linear features
-                # Longer segments contribute more to network-level metrics  
+                # Longer segments contribute more to network-level metrics
                 # Use for: Stream health, corridor connectivity, infrastructure
                 self.data["Length_m"] = self.data.geometry.length
                 measure_field = "Length_m"
@@ -398,16 +554,16 @@ class SpatialScale:
                 # Use for: Monitoring site density, species occurrence frequency
                 self.data["Count"] = 1
                 measure_field = "Count"
-        
+
         # Apply measure multiplier if specified (e.g., convert units)
         if measure_multiplier and measure_field:
             print(f"  Applying multiplier {measure_multiplier} to {measure_field}")
             self.data[measure_field] *= measure_multiplier
-        
+
         self.measure_field = measure_field
         self.type_field = type_field
         self.geometry_type = geometry_type
-    
+
     def __str__(self) -> str:
         """Create a human-readable description of this spatial scale."""
         scale_type = "BASE SCALE" if self.is_base_scale else "AGGREGATION SCALE"
@@ -553,15 +709,15 @@ def assign_functional_group(type_value: str, base_scale_name: str, group_rules: 
     """
     if base_scale_name not in group_rules:
         return None
-        
+
     type_lower = type_value.lower()
     scale_rules = group_rules[base_scale_name]
-    
+
     # Check each group - convert keywords to lowercase for case-insensitive matching
     for group_name, keywords in scale_rules.items():
         keywords_lower = [keyword.lower() for keyword in keywords]
-        if all(keyword in type_lower for keyword in keywords_lower):
+        if any(keyword in type_lower for keyword in keywords_lower):
             return group_name
-    
+
     # Handle unmatched types based on configuration
     return type_value if include_unmatched else None

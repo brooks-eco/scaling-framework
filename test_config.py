@@ -31,13 +31,13 @@ BASE_SCALE = {
     "unique_id": "UID",
     "measure_field": "Area_Ha",
     "type_field": "HabitatTyp",  # Truncated by shapefile format
-    "aggregation_method": "geometry"
+    "aggregation_method": "geometry",
 }
 
 # =============================================================================
 # TEST GROUPING CONFIGURATION
 # =============================================================================
-INCLUDE_UNMATCHED_TYPES = True
+INCLUDE_UNMATCHED_TYPES = False
 
 # Test functional group rules
 GROUP_RULES = {
