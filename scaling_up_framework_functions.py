@@ -15,411 +15,35 @@ For novice users:
 - Each function has detailed comments explaining what it does
 """
 
-import os
 import pandas as pd
 import numpy as np
 import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import re
+from matplotlib.lines import Line2D
 from typing import List, Optional, Union
 from pathlib import Path
-
-# =============================================================================
-# IMPORT SETTINGS FROM CONFIG FILE
-# =============================================================================
-# Try to load settings from config.py, use defaults if file not found
-try:
-    from config import MILLENNIUM_DROUGHT_YEARS, DEFAULT_CRS
-except ImportError:
-    # Fallback values if config not available (shouldn't normally happen)
-    print("Warning: Could not load config.py, using default values")
-    MILLENNIUM_DROUGHT_YEARS = [2002, 2003, 2006, 2007, 2008, 2009]
-    DEFAULT_CRS = "EPSG:3577"
-
-
-def validate_csv_data(df: pd.DataFrame, metric_name: str, unique_id: str) -> pd.DataFrame:
-    """
-    Validate that CSV data contains required columns and has proper format.
-    
-    Args:
-        df: Input dataframe to validate
-        metric_name: Name of the metric column that should exist
-        unique_id: Name of the unique ID column that should exist
-        
-    Returns:
-        Validated dataframe
-        
-    Raises:
-        ValueError: If required columns are missing or data format is invalid
-    """
-    # Check for required columns
-    required_cols = [unique_id, metric_name]
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Required columns {missing_cols} not found in CSV.\n"
-                        f"Available columns: {list(df.columns)}\n"
-                        f"Please ensure your CSV contains '{unique_id}' and '{metric_name}' columns.")
-
-    # Check for year column (optional)
-    has_year = "year" in df.columns
-    if has_year:
-        print(f"Year column detected - will perform temporal analysis")
-        # Validate year column
-        if df["year"].isna().any():
-            print("Warning: Some year values are missing - these rows will be excluded")
-            df = df.dropna(subset=["year"])
-        # Convert year to integer
-        df["year"] = df["year"].astype(int)
-    else:
-        print(f"No year column found - will perform single-time aggregation")
-
-    # Check for missing values in required columns
-    for col in required_cols:
-        missing_count = df[col].isna().sum()
-        if missing_count > 0:
-            print(f"Warning: {missing_count} missing values in '{col}' column - these rows will be excluded")
-            df = df.dropna(subset=[col])
-
-    # Validate metric column is numeric
-    if not pd.api.types.is_numeric_dtype(df[metric_name]):
-        try:
-            df[metric_name] = pd.to_numeric(df[metric_name], errors='coerce')
-            nan_count = df[metric_name].isna().sum()
-            if nan_count > 0:
-                print(f"Warning: {nan_count} non-numeric values in '{metric_name}' converted to NaN")
-                df = df.dropna(subset=[metric_name])
-        except:
-            raise ValueError(f"Column '{metric_name}' contains non-numeric data that cannot be converted")
-
-    print(f"Validation complete: {len(df)} valid records")
-    return df
-
-
-def pivot_year(df: pd.DataFrame, metric_name: str, unique_id: str = "UID") -> pd.DataFrame:
-    """
-    Pivot ecological time series data to years as columns and calculate baseline statistics.
-    Only used when year column is present in the data.
-    
-    Args:
-        df: Input dataframe with year, metric columns
-        metric_name: Name of metric column to pivot
-        unique_id: Primary key column name
-        
-    Returns:
-        DataFrame with pivoted years and calculated baseline statistics
-    """
-    if "year" not in df.columns:
-        # No year column - return data as-is
-        return df.set_index(unique_id)  #[[metric_name]]
-    
-    # Get all available years
-    years = df["year"].unique().tolist()
-   
-    pivoted_data = df.pivot(index=unique_id, columns="year", values=metric_name)
-    
-    # Calculate statistics for all years
-    years_data = pivoted_data[years]
-    
-    baseline_stats = {
-        "count": years_data.count(axis=1, numeric_only=True),
-        "baseline": years_data.mean(axis=1, numeric_only=True),
-        "stddev": years_data.std(axis=1, numeric_only=True),
-        "max": years_data.max(axis=1, numeric_only=True),
-        "median": years_data.median(axis=1, numeric_only=True)
-    }
-    
-    # Calculate MAD (Median Absolute Deviation) - robust measure of variability
-    # MAD is preferred over standard deviation for ecological data with outliers
-    # Common in species counts, vegetation indices with extreme values
-    mad_values = []
-    for year in years:
-        mad_values.append(abs(baseline_stats["median"] - pivoted_data[year]))
-        # set column
-    baseline_stats["mad"] = pd.concat(mad_values, axis=1).median(axis=1, numeric_only=True)
-    
-    print (baseline_stats.keys())
-    
-    #set series headings for each baseline_stats
-    for key, value in baseline_stats.items():
-        baseline_stats[key] = value.rename(f"{metric_name}_{key}")
-    
-    # Combine all results
-    result_dfs = [pivoted_data] + list(baseline_stats.values())
-    return pd.concat(result_dfs, axis=1)
-
-
-def aggregate_measure_weighted(
-    df: pd.DataFrame,
-    aggregator: pd.DataFrame,
-    boundary_fields: List[str],
-    measure_field: str,
-    functional_groups: Optional[List[str]] = None,
-    metric_columns: List[str] = None,
-    aggregation_method: str = "geometry",
-    is_base_scale: bool = False,
-) -> pd.DataFrame:
-    """
-    Aggregate ecological data across spatial scales using appropriate weighting methods.
-
-    This is the core aggregation function that scales up ecological metrics from
-    fine-scale units (sites, patches, segments) to larger management units
-    (wetland complexes, valleys, basins) using ecologically appropriate weighting.
-
-    Ecological Examples:
-        - Vegetation NDVI: Area-weighted mean across habitat patches → valley condition
-        - Stream health: Length-weighted mean across river segments → catchment health
-        - Species counts: Sum across monitoring sites → regional abundance
-        - Habitat patches: Count of patches → landscape fragmentation metric
-
-    Weighting Logic:
-        - Points: Equal weighting (count=1) or sum of attribute values
-        - all:  frequency of occurrence within the aggregation boundary
-        - Lines: Length-weighted for metrics affected by stream/corridor extent
-        - Polygons: Area-weighted for metrics affected by habitat/patch size
-
-    Args:
-        df: Parameter values per base scale unit (sites, patches, segments)
-        aggregator: Aggregator spatial units (complexes, valleys) or None for base scale
-        boundary_fields: Fields to group by for aggregation (e.g., ["ValleyName"])
-        measure_field: Field containing area/length/count for weighting
-        functional_groups: Additional grouping fields (e.g., ["HabitatType"])
-        is_base_scale: True if this is the base scale (no spatial aggregation)
-
-    Returns:
-        Measure-weighted aggregated values with ecological meaning preserved
-    """
-    if functional_groups is None:
-        functional_groups = []
-    print(f"Functional groups: {functional_groups}")
-
-    if metric_columns is None:
-        metric_columns = (
-            df.select_dtypes(include=[np.number])
-            .columns.difference([measure_field])
-            .tolist()
-        )
-    print(f"metric_columns : {metric_columns}")
-
-    grouping_columns = boundary_fields + functional_groups
-    print(f"grouping_columns : {grouping_columns}")
-
-    # Ensure aggregator is valid before accessing columns
-    if aggregation_method not in ["geometry", "count", "sum", "frequency"]:
-        raise ValueError(
-            f"Invalid aggregation method: {aggregation_method}\n"
-            f"Supported methods: 'geometry', 'count', 'sum', 'frequency'"
-        )
-
-    if aggregation_method == "count":
-        # Count aggregation - a simple count of features within the aggregation boundary
-        # This counts how many base units contribute to each aggregation boundary
-        # Group by aggregation boundaries and count base units
-        return aggregator.groupby(grouping_columns).size().to_frame(name="count")
-
-    joined_data = df.join(aggregator, how="inner").replace([np.inf, -np.inf], np.nan)
-    print(f"Aggregating {len(joined_data)} records across {len(aggregator)} boundaries")
-
-    # -----------------------------------------------------------------
-    # Sum aggregation
-    # -----------------------------------------------------------------
-
-    # Sum aggregation - sums attribute values across aggregation boundaries
-    # This is used when the attribute values themselves are meaningful
-    # E.g., total species abundance, carbon storage, management costs
-    # It does not consider the size of the features, just their values
-
-    if aggregation_method == "sum":
-        # Group by aggregation boundaries and sum base unit values
-        # This sums the base unit values for each aggregation boundary
-        aggregated_results = (
-            joined_data[metric_columns + grouping_columns]
-            .groupby(grouping_columns)[metric_columns]
-            .sum(numeric_only=True)
-        )
-
-    elif aggregation_method == "frequency":
-
-        # -----------------------------------------------------------------
-        # Frequency Aggregation
-        # -----------------------------------------------------------------
-
-        if not functional_groups:
-            raise ValueError(
-                "Frequency weighting requires functional_groups to define subgroups within boundaries."
-            )
-
-        # Step 1: Frequency counts per boundary–group
-        frequency_counts = joined_data.groupby(grouping_columns).size().rename("freq")
-
-        # Step 2: Total counts per boundary
-        total_counts = frequency_counts.groupby(boundary_fields).sum().rename("total")
-
-        # Step 3: Join to get frequency weights
-        frequency_weights = frequency_counts.to_frame().join(
-            total_counts, on=boundary_fields
-        )
-        frequency_weights["weight"] = (
-            frequency_weights["freq"] / frequency_weights["total"]
-        )
-
-        # Step 4: Join weights back to the data
-        joined_data = joined_data.join(frequency_weights["weight"], on=grouping_columns)
-
-        # Step 5: Apply weights to metrics
-        weighted_metrics = joined_data[metric_columns].multiply(
-            joined_data["weight"], axis=0
-        )
-
-        # Step 6: Aggregate weighted metrics to boundary
-        aggregated_results = weighted_metrics.groupby(boundary_fields).sum()
-
-    else:
-        # -----------------------------------------------------------------
-        # Geometry Aggregation
-        # -----------------------------------------------------------------
-
-        # Geometry aggregation - gives more weight to larger features and requires a measure field
-        # to quantity the area/length of each base unit contributing to the aggregation
-
-        # Weighting is achieved by multiplying metrics by area/length/count
-        # This ensures larger features contribute more to landscape metrics
-        # than smaller patches, preserving ecological meaning
-        if measure_field not in joined_data.columns:
-            raise ValueError(
-                f"Measure field '{measure_field}' not found in joined data.\n"
-                f"Available columns: {list(joined_data.columns)}\n"
-                f"Please ensure the measure field is correctly specified."
-            )
-        joined_data[metric_columns] = joined_data[metric_columns].multiply(
-            joined_data[measure_field], axis=0
-        )
-        # print ( joined_data[metric_columns])
-        # Group by aggregation boundaries and sum weighted values
-        # Sums both the weighted metrics and the measures (total area/length/count)
-        aggregated_results = (
-            joined_data[metric_columns + [measure_field] + grouping_columns]
-            .groupby(grouping_columns)
-            .sum(numeric_only=True)
-        )
-        # Normalize by total measure to get proper weighted averages
-        # Converts weighted sums back to meaningful ecological units
-        # E.g., (sum of area*NDVI) / (total area) = area-weighted mean NDVI
-        aggregated_results[metric_columns] = aggregated_results[metric_columns].div(
-            aggregated_results[measure_field], axis=0
-        )
-    if aggregation_method in ["sum", "geometry", "frequency"]:
-        return aggregated_results[
-            metric_columns
-            + ([measure_field] if measure_field in aggregated_results.columns else [])
-        ]
-    elif aggregation_method == "count":
-        return aggregated_results
-
-
-def aggregate_count(
-    df: pd.DataFrame,
-    aggregator: pd.DataFrame,
-    boundary_fields: List[str],
-    functional_groups: Optional[List[str]] = None,
-    is_base_scale: bool = False,
-) -> pd.DataFrame:
-    """
-    Aggregate ecological data across spatial scales using a simple count.
-
-    This is the core aggregation function that scales up ecological metrics from
-    fine-scale units (sites, patches, segments) to larger management units
-    (wetland complexes, valleys, basins) using a simple count of base units.
-
-    Ecological Examples:
-        - Habitat patches: Count of patches → landscape fragmentation metric
-        - Monitoring sites: Count of sites → regional abundance
-
-    Args:
-        df: Parameter values per base scale unit (sites, patches, segments)
-        aggregator: Aggregator spatial units (complexes, valleys) or None for base scale
-        boundary_fields: Fields to group by for aggregation (e.g., ["ValleyName"])
-        functional_groups: Additional grouping fields (e.g., ["HabitatType"])
-        is_base_scale: True if this is the base scale (no spatial aggregation)
-
-    Returns:
-        Count of base units aggregated across aggregation boundaries
-    """
-    if functional_groups is None:
-        functional_groups = []
-
-    # Ensure df is valid before accessing columns
-    if df is None or df.empty:
-        raise ValueError("Input DataFrame is None or empty")
-
-    metric_columns = df.select_dtypes(include=[np.number]).columns.values.tolist()
-
-    grouping_columns = boundary_fields + functional_groups
-
-    # # Base scale - no spatial aggregation, just group by functional types
-    # # Used for base-level analysis (e.g., NDVI by habitat type within sites)
-    if is_base_scale:
-        # grp column already exists from base scale loading (GROUP_RULES applied)
-        # numeric_cols = joined_data.select_dtypes(include=[np.number]).columns.tolist()
-        # return joined_data[metric_columns + [measure_field] + grouping_columns].set_index(grouping_columns, append=True)
-        return joined_data
-
-    print(f"Aggregating {len(df)} records across {len(aggregator)} boundaries")
-
-    joined_data = df.join(aggregator, how="inner").replace([np.inf, -np.inf], np.nan)
-    # Group by aggregation boundaries and sum weighted values
-    # Sums both the weighted metrics and the measures (total area/length/count)
-    aggregated_results = (
-        joined_data[metric_columns + grouping_columns]
-        .groupby(grouping_columns)
-        .count(numeric_only=True)
-    )
-    # print(aggregated_results)
-
-    return aggregated_results[metric_columns]
-
-
-def standardise_z(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Z-score standardization of input dataframe.
-    
-    Args:
-        df: Input dataframe to standardize
-        
-    Returns:
-        Z-score standardized dataframe
-    """
-    return (df - df.mean()) / df.std()
-
-
-def normalise(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Min-max normalization to scale values between 0 and 1.
-    
-    Args:
-        df: Input dataframe to normalize
-        
-    Returns:
-        Normalized dataframe with values between 0-1
-    """
-    df_min = df.min().min() if hasattr(df.min(), 'min') else df.min()
-    df_max = df.max().max() if hasattr(df.max(), 'max') else df.max()
-    
-    return (df - df_min) / (df_max - df_min)
+from geopandas import GeoDataFrame
+from shapely.validation import make_valid, explain_validity
+from pyproj import CRS
 
 
 class SpatialScale:
     """
     A class that represents one spatial scale in your analysis.
-    
+
     Think of this as a "container" that holds:
     - Your spatial data (points, lines, or polygons)
     - Information about how to measure each feature (area, length, count)
     - Rules for grouping similar features together
-    
+
     This class handles all the technical details of:
     - Loading shapefiles
     - Detecting geometry types (point/line/polygon)
     - Calculating appropriate measures (area in hectares, length in meters, etc.)
     - Validating that your data is properly formatted
-    
+
     For novice users:
     - One SpatialScale = one shapefile in your analysis
     - The "base scale" contains your smallest features
@@ -432,31 +56,30 @@ class SpatialScale:
         name: str,
         source: Union[str, Path],
         unique_id_field: Union[str, List[str]],
-        measure_field: Optional[str] = None,
+        weighting_field: Optional[str] = None,
+        metric_fields: Optional[List[str]] = None,
         measure_multiplier: Optional[float] = None,
         type_field: Optional[str] = None,
-        aggregation_method: str = "geometry",
-        extra_columns: Optional[List[str]] = None,
+        default_crs: str = None,
         is_base_scale: bool = False,
     ):
         """
         Create a new spatial scale for analysis.
-        
+
         This function loads your shapefile and prepares it for analysis by:
         1. Reading the geographic data
         2. Detecting what type of geometry it contains (points/lines/polygons)
         3. Calculating appropriate measures (area/length/count)
         4. Validating that everything looks correct
-        
+
         Parameters explained in plain English:
             name: A short name for this scale (used in output files)
             source: Path to your shapefile
             unique_id_field: Column that uniquely identifies each feature
-            measure_field: Column containing size/importance measure (or None to auto-calculate)
+            weighting_field: Column containing size/importance measure (or None to auto-calculate)
+            metric_fields: List of columns containing measures to be used for analysis
             measure_multiplier: Number to multiply measures by (usually leave as None)
-            aggregation_method: How to weight features ("geometry", "count", or "sum")
             type_field: Column containing feature types for grouping (or None for no grouping)
-            extra_columns: Additional columns to load from shapefile
             is_base_scale: True if this is your smallest scale, False for larger scales
         """
         self.name = name
@@ -465,259 +88,977 @@ class SpatialScale:
 
         # Check that the shapefile actually exists
         if not self.source.exists():
-            raise FileNotFoundError(f"Cannot find shapefile: {source}\n"
-                                  f"Please check that the file exists and the path is correct.")
+            raise FileNotFoundError(
+                f"Cannot find shapefile: {source}\n"
+                f"Please check that the file exists and the path is correct."
+            )
 
-        # Convert unique_id_field to a list format (technical requirement)
-        # This allows for compound keys if needed (multiple columns)
-        self.unique_id = [unique_id_field] if isinstance(unique_id_field, str) else unique_id_field
+        # Store unique_id as string (convert from list if needed)
+        self.unique_id_field = (
+            unique_id_field if isinstance(unique_id_field, str) else unique_id_field[0]
+        )
 
-        # Build list of columns to load from the shapefile
+        # -----------------------------------------------------
+        # Determine which columns are required from the shapefile
         # Only load what we need to make processing faster
-        cols = self.unique_id.copy()  # Always need the ID field
-        if measure_field:
-            cols.append(measure_field)    # Size/importance measure
+        # -----------------------------------------------------
+        required_cols = {self.unique_id_field}
+        if weighting_field:
+            required_cols.add(weighting_field)
         if type_field:
-            cols.append(type_field)       # Feature types for grouping
-        if extra_columns:
-            cols.extend([c for c in extra_columns if c not in cols])  # Any additional fields
+            required_cols.add(type_field)
+        if metric_fields:
+            if isinstance(metric_fields, str):
+                metric_fields = [metric_fields]
+            required_cols.update(metric_fields)
 
-        # Load the shapefile and convert to standard coordinate system
-        # This ensures all spatial calculations are accurate
+        # Ensure geometry is included (required for GeoPandas)
+        required_cols = list(required_cols)
+        required_cols.append("geometry")  # geometry must be present
+
         print(f"Loading {name} data from {self.source.name}...")
-        self.data = gpd.read_file(self.source, columns=cols).to_crs(DEFAULT_CRS)
+        print(f"   Requested: {required_cols}")
+
+        # Handle CRS - default to EPSG:4326 if not specified or invalid
+        try:
+            self.default_crs = (
+                CRS.from_user_input(default_crs) if default_crs else CRS.from_epsg(3577)
+            )
+        except:
+            print(
+                f"   Invalid CRS '{default_crs}', using EPSG:3577 (Australian Albers)"
+            )
+            self.default_crs = CRS.from_epsg(3577)
+        print(f"   Using CRS: {self.default_crs.name}.")
+
+        # Read and validate shapefile
+        self.data = self._validate_geometries(
+            gpd.read_file(self.source).to_crs(self.default_crs), fix_invalid=True
+        )
+
+        # Convert columns to strings (if not already)
+        self.data.columns = self.data.columns.map(str)
+
+        # Convert required_cols to strings to match DataFrame columns
+        required_cols = [str(c) for c in required_cols]
+
+        # Select columns based on whether metric_fields is specified
+        if metric_fields:
+            # Only keep required columns when metric_fields is specified
+            cols_to_keep = list(set(required_cols) | {"geometry"})
+            self.data = self.data.loc[:, cols_to_keep]
+        print(f"   No specific metric fields chosen so loading all columns.")
+        cols = [col for col in self.data.columns if col != "geometry"]
+        print(f"   Loaded: {cols}")
+        # If metric_fields is None, retain all columns (no filtering)
 
         # Handle complex geometries by breaking them into simple parts
         # E.g., a MultiPolygon becomes multiple separate Polygons
         # This ensures each feature is treated as a separate unit for analysis
-        multi_geom_count = self.data.geometry.geom_type.isin(['MultiPolygon', 'MultiLineString', 'MultiPoint']).sum()
+        multi_geom_count = self.data.geometry.geom_type.isin(
+            ["MultiPolygon", "MultiLineString", "MultiPoint"]
+        ).sum()
         if multi_geom_count > 0:
-            print(f"  Breaking {multi_geom_count} complex geometries into simple parts...")
+            print(
+                f"   Breaking {multi_geom_count} complex geometries into simple parts..."
+            )
             self.data = self.data.explode(index_parts=False).reset_index(drop=True)
 
-        self.data = validate_geometries(self.data)
-
         # Check that all required columns exist in the shapefile
-        missing_cols = [c for c in cols if c not in self.data.columns]
+        missing_cols = [c for c in required_cols if c not in self.data.columns]
         if missing_cols:
-            raise ValueError(f"Required columns {missing_cols} not found in {source}\n"
-                           f"Available columns: {list(self.data.columns)}\n"
-                           f"Please check your column names in config.py")
+            raise ValueError(
+                f"Required columns {missing_cols} not found in {source}\n"
+                f"Available columns: {list(self.data.columns)}\n"
+                f"Please check your column names in config.py"
+            )
 
         # Automatically detect what type of geometry this shapefile contains
         # This determines how we calculate measures and perform aggregation
         first_geom = self.data.geometry.iloc[0]
-        if first_geom.geom_type == 'Polygon':
-            geometry_type = "polygon"    # Areas (wetlands, habitats, management units)
-        elif first_geom.geom_type == 'LineString':
-            geometry_type = "line"       # Linear features (rivers, transects, corridors)
-        elif first_geom.geom_type == 'Point':
-            geometry_type = "point"      # Point locations (monitoring sites, observations)
-            if aggregation_method not in ["count", "sum"]:
-                print(
-                    f"  WARNING: Point data detected. Setting aggregation method to 'count'."
-                )
-                aggregation_method = "count"
+        if first_geom.geom_type == "Polygon":
+            geometry_type = "polygon"  # Areas (wetlands, habitats, management units)
+        elif first_geom.geom_type == "LineString":
+            geometry_type = "line"  # Linear features (rivers, transects, corridors)
+        elif first_geom.geom_type == "Point":
+            geometry_type = "point"  # Point locations (monitoring sites, observations)
         else:
             raise ValueError(f"Unsupported geometry type: {first_geom.geom_type}")
 
-        print(f"  Detected geometry type: {geometry_type} ({len(self.data)} features)")
+        print(f"   Detected geometry type: {geometry_type} ({len(self.data)} features)")
 
-        # Calculate appropriate measure based on aggregation method and geometry
-        # This determines how ecological features are weighted in aggregation
-        if not measure_field:
-            if aggregation_method == "count":
-                # Count aggregation: Each feature contributes equally (presence/absence)
-                # Use for: Number of habitat patches, monitoring sites, species occurrences
-                self.data["Count"] = 1
-                measure_field = "Count"
-            elif aggregation_method == "sum":
-                # Sum aggregation: Add attribute values, ignoring feature size
-                # Use for: Total species abundance, carbon storage, management costs
-                # Default to 1, but user should provide actual values in measure_field
-                self.data["Sum"] = 1  
-                measure_field = "Sum"
-            elif geometry_type == "polygon":
-                # Area-weighted aggregation for habitat/vegetation patches
-                # Larger patches contribute more to landscape-level metrics
-                # Use for: Vegetation condition, habitat quality, land cover metrics
-                self.data["Area_Ha"] = self.data.geometry.area / 10000  # Convert m² to hectares
-                measure_field = "Area_Ha"
+        # Calculate default weighting field based on geometry type
+        if not weighting_field:
+            if geometry_type == "polygon":
+                self.data["Area_Ha"] = self.data.geometry.area / 10000
+                weighting_field = "Area_Ha"
             elif geometry_type == "line":
-                # Length-weighted aggregation for linear features
-                # Longer segments contribute more to network-level metrics
-                # Use for: Stream health, corridor connectivity, infrastructure
                 self.data["Length_m"] = self.data.geometry.length
-                measure_field = "Length_m"
+                weighting_field = "Length_m"
             elif geometry_type == "point":
-                # Point features default to count (each location = 1 unit)
-                # Use for: Monitoring site density, species occurrence frequency
                 self.data["Count"] = 1
-                measure_field = "Count"
+                weighting_field = "Count"
 
         # Apply measure multiplier if specified (e.g., convert units)
-        if measure_multiplier and measure_field:
-            print(f"  Applying multiplier {measure_multiplier} to {measure_field}")
-            self.data[measure_field] *= measure_multiplier
+        if measure_multiplier and weighting_field:
+            print(f"   Applying multiplier {measure_multiplier} to {weighting_field}")
+            self.data[weighting_field] *= measure_multiplier
 
-        self.measure_field = measure_field
-        self.type_field = type_field
+        self.metric_fields = metric_fields or []  # Metrics available for aggregation
+        self.weighting_field = (
+            weighting_field  # Field used for weighting (area, length, etc.)
+        )
+        self.type_field = (
+            type_field  # Optional field for type-based grouping/reclassification
+        )
         self.geometry_type = geometry_type
+        self._join_cache = {}  # Cached spatial join results
+        self.results = {}  # Stores aggregation results keyed by result name
 
     def __str__(self) -> str:
         """Create a human-readable description of this spatial scale."""
         scale_type = "BASE SCALE" if self.is_base_scale else "AGGREGATION SCALE"
         return f"{self.name} ({scale_type}) - {len(self.data)} features from {self.source.name}"
 
+    def _validate_geometries(
+        self, gdf: gpd.GeoDataFrame, fix_invalid: bool = True
+    ) -> gpd.GeoDataFrame:
+        """
+        Validate and optionally fix invalid geometries.
 
-def validate_geometries(gdf: gpd.GeoDataFrame, fix_invalid: bool = True) -> gpd.GeoDataFrame:
-    """
-    Validate and optionally fix invalid geometries.
-    
-    Args:
-        gdf: GeoDataFrame to validate
-        fix_invalid: Whether to attempt fixing invalid geometries
-        
-    Returns:
-        GeoDataFrame with validated geometries
-    """
-    from shapely.validation import make_valid, explain_validity
-    
-    invalid_mask = ~gdf.geometry.is_valid
-    invalid_count = invalid_mask.sum()
-    
-    if invalid_count == 0:
-        print("All geometries are valid.")
+        Args:
+            gdf: GeoDataFrame to validate.
+            fix_invalid: Whether to attempt fixing invalid geometries.
+
+        Returns:
+            GeoDataFrame with validated geometries.
+        """
+        invalid_mask = ~gdf.geometry.is_valid
+        invalid_count = invalid_mask.sum()
+
+        if invalid_count == 0:
+            print("   All geometries are valid.")
+            return gdf
+
+        print(f"\u26a0 Found {invalid_count} invalid geometries.")
+
+        if fix_invalid:
+            print("   Attempting to fix invalid geometries...")
+            gdf.loc[invalid_mask, "geometry"] = gdf.loc[invalid_mask, "geometry"].apply(
+                make_valid
+            )
+
+            still_invalid = (~gdf.geometry.is_valid).sum()
+            if still_invalid == 0:
+                print("   All geometries successfully fixed.")
+            else:
+                print(
+                    f"\u26a0 Warning: {still_invalid} geometries remain invalid after repair."
+                )
+
         return gdf
-    
-    print(f"Found {invalid_count} invalid geometries")
-    
-    if fix_invalid:
-        print("Attempting to fix invalid geometries...")
-        gdf.loc[invalid_mask, 'geometry'] = gdf.loc[invalid_mask, 'geometry'].apply(make_valid)
-        
-        # Check if fixes worked
-        still_invalid = (~gdf.geometry.is_valid).sum()
-        if still_invalid == 0:
-            print("All geometries successfully fixed.")
+
+    @staticmethod
+    def validate_result_name(name: str, existing_keys: Optional[set] = None) -> str:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("result_name must be a non-empty string.")
+        if not re.match(r"^[\w\-]+$", name):
+            raise ValueError(
+                "result_name can only contain letters, numbers, underscores, or dashes."
+            )
+
+        if existing_keys and name in existing_keys:
+            orig_name = name
+            for i in range(1, 11):
+                name = f"{orig_name}_{i}"
+                if name not in existing_keys:
+                    print(
+                        f"\u26a0 Warning Result '{orig_name}' exists. Using '{name}' instead."
+                    )
+                    return name
+            raise ValueError(
+                f"Too many results named '{orig_name}'. Choose a different name."
+            )
+
+        return name
+
+    def join_data(
+        self,
+        data_path: Union[str, Path],
+        tabular_data_unique_id_field: Optional[str] = None,
+        pivot_row_id: Optional[List[str]] = None,
+        pivot_columns: Optional[str] = None,
+        pivot_values: Optional[str] = None,
+        how: str = "inner",
+    ) -> None:
+        """
+        Load external tabular data and join it to the SpatialScale's data.
+
+        Supports:
+        1. Direct join if data is in wide format (one row per unique_id).
+        2. Pivoting long data (key-value) into wide before join.
+
+        Args:
+            data_path: Path to the CSV or tabular data file.
+            unique_id_field: Column in the CSV matching source unique ID. If None, defaults to self.unique_id.
+            pivot_index: If pivoting, list of columns to use as index.
+            pivot_columns: If pivoting, column name whose values become new columns.
+            pivot_values: If pivoting, column name containing values to fill.
+            how: Type of join to perform (default "left").
+
+        Raises:
+            ValueError if required columns not found.
+        """
+
+        # Load CSV data
+        tabular_data = pd.read_csv(data_path)
+
+        # Determine the ID field to use
+        if tabular_data_unique_id_field is None:
+            tabular_data_unique_id_field = self.unique_id_field
+
+        pivot_row_id = [pivot_row_id] if isinstance(pivot_row_id, str) else pivot_row_id
+
+        # Check unique_id field exists
+        if tabular_data_unique_id_field not in tabular_data.columns:
+            raise ValueError(
+                f"unique_id_field '{tabular_data_unique_id_field}' not found in data columns: {list(tabular_data.columns)}"
+            )
+        if (
+            not pivot_row_id
+            and tabular_data[tabular_data_unique_id_field].duplicated().any()
+        ):
+            print(
+                "\u26a0 Warning: Duplicate IDs found in tabular data. Consider pivoting?"
+            )
+
+        # Pivot if requested (assuming long format data)
+        if pivot_row_id and pivot_columns and pivot_values:
+            missing_cols = [
+                c
+                for c in [*pivot_row_id, pivot_columns, pivot_values]
+                if c not in tabular_data.columns
+            ]
+            if missing_cols:
+                raise ValueError(f"Missing columns required for pivot: {missing_cols}")
+
+            tabular_data = tabular_data.pivot_table(
+                index=pivot_row_id,
+                columns=pivot_columns,
+                values=pivot_values,
+                aggfunc="first",
+            ).reset_index()
+
+        # ensure all column headers are strings
+        tabular_data_clean = self._validate_metric_data(
+            tabular_data,
+            self.unique_id_field,
+            not_allowed=[self.weighting_field, self.type_field],
+        )
+
+        # Single merge operation handles both same and different column names
+        self.data = self.data.merge(
+            tabular_data_clean,
+            how=how,
+            left_on=self.unique_id_field,
+            right_on=tabular_data_unique_id_field,
+            suffixes=("", "_external"),
+            validate="one_to_one",
+        )
+
+        print(
+            f"Joined external data from {data_path} on '{tabular_data_unique_id_field}'"
+        )
+
+    def spatial_join(
+        self, target_scale: "SpatialScale", how: str = "intersects"
+    ) -> GeoDataFrame:
+        """
+        Perform and cache a spatial join between this scale and a target scale.
+
+        Args:
+            target_scale: The target SpatialScale to join with.
+            how: The spatial predicate (e.g., "intersects", "contains").
+
+        Returns:
+            GeoDataFrame: Spatially joined data.
+        """
+        cache_key = f"{target_scale.name}_{how}"
+
+        if cache_key not in self._join_cache:
+            print(
+                f"Performing spatial join: {self.name} to {target_scale.name} using '{how}'"
+            )
+
+            # Resolve column name conflicts
+            source_cols = set(self.data.columns) - {"geometry"}
+            target_cols = set(target_scale.data.columns) - {"geometry"}
+            conflicting = source_cols & target_cols
+            rename_map = {col: f"{col}_target" for col in conflicting}
+
+            if rename_map:
+                print(
+                    f"\u26a0 Warning: Renaming {len(rename_map)} conflicting columns in target scale: {rename_map}"
+                )
+                target_scale.data = target_scale.data.rename(columns=rename_map)
+
+            # Update target's unique_id field if it was renamed
+            updated_uid = rename_map.get(target_scale.unique_id_field)
+            if updated_uid:
+                target_scale.unique_id_field = updated_uid
+                print(
+                    f"\u26a0 Warning: Updated target scale unique_id_field to '{updated_uid}'"
+                )
+
+            # Run the spatial join (inner join only, to maintain overlaps)
+            joined = gpd.sjoin(self.data, target_scale.data, how="inner", predicate=how)
+            self._join_cache[cache_key] = joined
+
         else:
-            print(f"Warning: {still_invalid} geometries remain invalid after repair.")
-    
-    return gdf
+            print(f"Using cached spatial join: {cache_key}")
+
+        return self._join_cache[cache_key]
+
+    def aggregate_joined(
+        self,
+        df: GeoDataFrame,
+        target_scale: "SpatialScale",
+        metric_columns: list[str],
+        method: str = "weighted_mean",
+        reclass_map: dict[str, str] = None,
+        group_by: list[str] = None,
+        result_name: str = None,
+        keep_unmatched: bool = True,
+        weighting_field: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Aggregate metrics from a spatial join result into the target spatial scale.
+
+        All aggregation types are handled using a unified weighted framework:
+        - "count": metric=1, weight=1
+        - "sum": metric=values, weight=1
+        - "weighted_mean": metric=values, weight=from field
+        - "frequency_weighted": metric=values, weight=frequency / total per group
+
+        Args:
+            df: Joined GeoDataFrame of source + target features.
+            target_scale: The SpatialScale to aggregate into.
+            metric_columns: List of fields to aggregate.
+            method: Aggregation method.
+            reclass_map: Optional mapping from types to groups.
+            group_by: Optional extra grouping fields.
+            result_name: Key to store result in target_scale.results.
+            keep_unmatched: Whether to retain unmapped types if reclass_map is provided.
+            weighting_field: Optional override of default weight field.
+
+        Returns:
+            DataFrame: Aggregated result (without geometry).
+        """
+        df = df.copy()
+        weight_field = weighting_field or self.weighting_field
+        metric_columns = [str(col) for col in (metric_columns or [])]
+
+        # --- Handle type reclassification ---
+        reclass_field = None
+        if reclass_map and self.type_field:
+            print(
+                f"Reclassifying '{self.type_field}' into new groups '_grp_' using supplied reclass map..."
+            )
+            flat_map = {
+                t: g
+                for g, types in reclass_map.items()
+                for t in (types if isinstance(types, (list, set, tuple)) else [types])
+            }
+            df["_grp_"] = df[self.type_field].map(flat_map)
+            unmatched = df[df["_grp_"].isna()][self.type_field].unique()
+            if len(unmatched) > 0:
+                if not keep_unmatched:
+                    df = df[~df["_grp_"].isna()].copy()
+                    print(f"Dropped {len(unmatched)} unmatched types")
+                else:
+                    print(f"Retained {len(unmatched)} unmatched types")
+            df["_grp_"] = df["_grp_"].fillna(df[self.type_field])
+            reclass_field = "_grp_"
+        elif self.type_field:
+            reclass_field = self.type_field
+
+        # --- Grouping keys ---
+        group_keys = [target_scale.unique_id_field]
+        if reclass_field:
+            group_keys.append(reclass_field)
+        if group_by:
+            group_keys += [g for g in group_by if g not in group_keys]
+
+        print(f"Aggregating by {group_keys} using '{method}'")
+
+        # --- Frequency-weighted method ---
+        if method == "frequency_weighted":
+            if not reclass_field:
+                raise ValueError("frequency_weighted requires a type or reclass field")
+
+            freq = df.groupby(group_keys).size().rename("freq")
+            total = freq.groupby(target_scale.unique_id_field).sum().rename("total")
+            weights = freq.to_frame().join(total, on=target_scale.unique_id_field)
+            weights["weight"] = weights["freq"] / weights["total"]
+            df = df.join(weights["weight"], on=group_keys)
+
+            weighted = df[metric_columns].multiply(df["weight"], axis=0)
+            for key in group_keys:
+                weighted[key] = df[key]
+            result = weighted.groupby(group_keys).sum().reset_index()
+            result.rename(
+                columns={col: f"{col}_frqwm" for col in metric_columns}, inplace=True
+            )
+
+        # --- Unified aggregation framework ---
+        # All methods follow the same pattern: metric * weight, then aggregate
+        # This leverages the fact that __init__ creates appropriate weight fields:
+        # - Count method: uses Count=1 (from aggregation_method="count")
+        # - Sum method: uses Sum=1 (from aggregation_method="sum")
+        # - Geometry method: uses Area_Ha, Length_m, or Count based on geometry type
+        elif method in {"count", "sum", "weighted_mean"}:
+
+            # Step 1: Determine metrics and weights based on method
+            if method == "count":
+                # Count aggregation: each feature = 1, weight = 1 (simple counting)
+                # Create Count field on-demand for this aggregation
+                df["Count"] = 1
+                metrics_to_use = ["Count"]
+                weight_to_use = "Count"
+                suffix = "count"
+
+            elif method == "sum":
+                # Sum aggregation: metric values, weight = 1 (unweighted sum)
+                # Create Sum field on-demand for this aggregation
+                if not metric_columns:
+                    raise ValueError("sum method requires metric_columns")
+                df["Sum"] = 1
+                metrics_to_use = metric_columns
+                weight_to_use = "Sum"
+                suffix = "sum"
+
+            elif method == "weighted_mean":
+                # Weighted mean: metric values, weight = area/length/count from __init__
+                # Uses Area_Ha, Length_m, or Count created in __init__ based on geometry type
+                if not metric_columns:
+                    raise ValueError("weighted_mean method requires metric_columns")
+                if not weight_field:
+                    raise ValueError("weighted_mean requires a weighting_field")
+                metrics_to_use = metric_columns
+                weight_to_use = weight_field
+                suffix = f"{weight_field[:4]}wm"  # e.g., "Area_wm" or "Leng_wm"
+
+            # Step 2: Apply the unified weighted aggregation formula
+            # Formula: (metric1*weight + metric2*weight + ...) / (weight1 + weight2 + ...)
+            weighted_metrics = df[metrics_to_use].multiply(df[weight_to_use], axis=0)
+            weighted_metrics.columns = [f"{col}_weighted" for col in metrics_to_use]
+
+            # Combine grouping keys, weights, and weighted metrics for aggregation
+            agg_df = pd.concat(
+                [
+                    df[
+                        group_keys + [weight_to_use]
+                    ].copy(),  # .copy() prevents SettingWithCopyWarning
+                    weighted_metrics,
+                ],
+                axis=1,
+            )
+
+            # Step 3: Group and sum all weighted values
+            grouped = agg_df.groupby(group_keys).sum().reset_index()
+
+            # Step 4: Calculate final results based on method
+            if method == "count":
+                # For count: just return the sum of weights (each weight=1, so this gives count)
+                result = grouped[group_keys + [weight_to_use]]
+                result.rename(columns={weight_to_use: "FeatureCount"}, inplace=True)
+
+            elif method == "sum":
+                # For sum: return the weighted sums (weight=1, so this gives unweighted sums)
+                result = grouped[
+                    group_keys + [f"{col}_weighted" for col in metrics_to_use]
+                ]
+                result.rename(
+                    columns={
+                        f"{col}_weighted": f"{col}_{suffix}" for col in metrics_to_use
+                    },
+                    inplace=True,
+                )
+
+            elif method == "weighted_mean":
+                # For weighted mean: divide weighted sums by weight sums to get averages
+                for col in metrics_to_use:
+                    grouped[f"{col}_{suffix}"] = (
+                        grouped[f"{col}_weighted"] / grouped[weight_to_use]
+                    )
+                result = grouped[
+                    group_keys + [f"{col}_{suffix}" for col in metrics_to_use]
+                ]
+
+        else:
+            raise ValueError(
+                f"Unsupported method: {method}. Choose from: "
+                f"count, sum, weighted_mean, frequency_weighted"
+            )
+
+        # --- Store results (without geometry) ---
+        if not hasattr(target_scale, "results") or target_scale.results is None:
+            target_scale.results = {}
+
+        result_name = SpatialScale.validate_result_name(
+            result_name, set(target_scale.results.keys())
+        )
+        target_scale.results[result_name] = result
+        print(f"Stored result in {target_scale.name}.results['{result_name}']")
+        return result
+
+    def aggregate_to(
+        self,
+        target_scale: "SpatialScale",
+        metric_columns: list[str],
+        method: str = "weighted_mean",
+        reclass_map: dict[str, str] = None,
+        group_by: list[str] = None,
+        result_name: str = None,
+        keep_unmatched: bool = True,
+        how: str = "intersects",
+        weighting_field: Optional[str] = None,
+    ) -> GeoDataFrame:
+        """
+        Spatially join and aggregate base scale metrics into the target scale.
+
+        This wraps the spatial join and aggregation into one call.
+
+        Args:
+            target_scale: The SpatialScale to aggregate into.
+            metric_columns: List of numeric fields to aggregate.
+            method: Aggregation method ("sum", "mean", "weighted_mean", etc.).
+            reclass_map: Optional mapping for grouping types (used if self.type_field exists).
+            group_by: Optional extra fields to group by (e.g., basin, catchment).
+            result_name: Key to store result in target_scale.results.
+            keep_unmatched: If False, drops types not in reclass_map.
+            how: Spatial join method (e.g., "intersects", "contains").
+            weighting_field: Optional override of this scale's weighting field.
+
+        Returns:
+            GeoDataFrame: Aggregated result with geometries from the target scale.
+        """
+        if not isinstance(target_scale, SpatialScale):
+            raise TypeError("target_scale must be a SpatialScale instance")
+
+        if not target_scale.source.exists():
+            raise FileNotFoundError(
+                f"Target scale file not found: {target_scale.source}"
+            )
+        # Semantic method aliases
+        semantic_aliases = {
+            "area_weighted": ("weighted_mean", "Area_Ha"),
+            "length_weighted": ("weighted_mean", "Length_m"),
+        }
+
+        # Translate semantic alias to real method and weighting field
+        if method in semantic_aliases:
+            actual_method, default_weight = semantic_aliases[method]
+            method = actual_method
+            if not weighting_field:
+                weighting_field = default_weight
+                print(f"Using '{weighting_field}' as weight for '{method}' aggregation")
+        elif weighting_field:
+            print(
+                f"Using '{weighting_field}' for '{weighting_field}_weighted' aggregation"
+            )
+        if not metric_columns:
+            raise ValueError("metric_columns cannot be empty")
+
+        metric_columns = [str(col) for col in metric_columns]
+
+        # Validate metric columns in this scale
+        self._validate_metric_data(
+            self.data,
+            unique_id=self.unique_id_field,
+            metric_field_names=metric_columns,
+            not_allowed=[self.type_field, self.weighting_field] + (group_by or []),
+        )
+
+        # Check result name validity before proceeding
+        if result_name:
+            existing_keys = getattr(target_scale, "results", {}).keys()
+            result_name = SpatialScale.validate_result_name(
+                result_name, existing_keys=set(existing_keys)
+            )
+
+        # Spatial join
+        joined_df = self.spatial_join(target_scale, how=how)
+
+        # Aggregate and store in target scale
+        return self.aggregate_joined(
+            joined_df,
+            target_scale,
+            metric_columns=metric_columns,
+            method=method,
+            reclass_map=reclass_map,
+            group_by=group_by,
+            result_name=result_name,
+            keep_unmatched=keep_unmatched,
+            weighting_field=weighting_field,
+        )
+
+    def save_results(
+        self,
+        output_folder: Union[str, Path],
+        file_types: Union[str, list[str]] = ".csv",
+    ) -> None:
+        """
+        Save the aggregated results from this SpatialScale to disk.
+
+        Results are stored internally without geometry and rejoined with
+        geometry from self.data before saving.
+
+        Args:
+            output_folder: Directory where files will be saved.
+            file_types: File types to save (e.g., ".csv", ".shp", ".gpkg").
+
+        Raises:
+            ValueError: If no results exist or unsupported file types provided.
+        """
+        if not self.results:
+            raise ValueError("No results to save. Run `aggregate_to` first.")
+
+        if output_folder == "list":
+            print("Available results:")
+            for result_name, result_df in self.results.items():
+                print(
+                    f"  {result_name.ljust(30)} - {str(len(result_df)).rjust(10)} rows {result_df.columns.tolist()}"
+                )
+            return
+
+        if output_folder is None:
+            print("No output path provided. Results not saved.")
+            return
+
+        # Normalize and prepare output folder
+        output_folder = Path.cwd() / Path(output_folder).name
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Normalize file types
+        file_types = [file_types] if isinstance(file_types, str) else file_types
+        file_types = [
+            f.lower() if f.startswith(".") else f".{f.lower()}" for f in file_types
+        ]
+        valid_types = {".csv", ".shp", ".gpkg"}
+
+        for ext in file_types:
+            if ext not in valid_types:
+                raise ValueError(
+                    f"Invalid file type: {ext}. Valid types: {', '.join(valid_types)}"
+                )
+
+        # Get base geometry for join
+        geometry_df = self.data[[self.unique_id_field, "geometry"]]
+
+        for result_name, result_df in self.results.items():
+            # Join geometry on demand
+            full_df = geometry_df.merge(result_df, on=self.unique_id_field, how="left")
+
+            # Clean column names (remove _target if possible)
+            rename_map = {
+                col: col.replace("_target", "")
+                for col in full_df.columns
+                if col.endswith("_target")
+                and col.replace("_target", "") not in full_df.columns
+            }
+            if rename_map:
+                full_df.rename(columns=rename_map, inplace=True)
+
+            for ext in file_types:
+                save_path = output_folder / f"{self.name}_{result_name}{ext}"
+
+                if ext == ".csv":
+                    full_df.drop(columns="geometry", errors="ignore").to_csv(
+                        save_path, index=False
+                    )
+                elif ext == ".gpkg":
+                    full_df.to_file(save_path, layer=self.name, driver="GPKG")
+                elif ext == ".shp":
+                    full_df.to_file(save_path, driver="ESRI Shapefile")
+
+                print(f"Saved {ext.upper()}: {save_path}")
+
+    def _validate_metric_data(
+        self,
+        df: pd.DataFrame,
+        unique_id: str = None,
+        metric_field_names: Optional[Union[str, list]] = None,
+        not_allowed: Optional[list] = None,
+        strict: bool = False,
+        set_index: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Validate that metric fields in a dataframe are numeric and do not conflict
+        with SpatialScale internal fields like unique_id, weighting_field, or type_field.
+
+        Args:
+            df: Input DataFrame or GeoDataFrame.
+            metric_field_names: Metric fields to validate. If None, infer from numeric fields.
+            group_by: Optional grouping fields to exclude from metrics.
+            strict: If True, raise if non-numeric or missing values are found.
+            set_index: If True, set index to self.unique_id_field.
+
+        Returns:
+            Cleaned DataFrame or GeoDataFrame with validated numeric metrics.
+        """
+        df = df.copy()
+        is_geo = isinstance(df, GeoDataFrame)
+
+        # Normalize columns
+        df.columns = df.columns.map(str)
+        unique_id = unique_id or self.unique_id_field
+        reserved = {
+            unique_id,
+            self.weighting_field,
+            self.type_field,
+            *(not_allowed or []),
+        }
+
+        if metric_field_names is None:
+            metric_field_names = [
+                col
+                for col in df.columns
+                if col not in reserved and pd.api.types.is_numeric_dtype(df[col])
+            ]
+            print(f"No metric fields specified. Inferred: {metric_field_names}")
+        else:
+            if isinstance(metric_field_names, str):
+                metric_field_names = [metric_field_names]
+            metric_field_names = [str(c) for c in metric_field_names]
+
+        # Check for conflicts
+        conflicts = [col for col in metric_field_names if col in reserved]
+        if conflicts:
+            raise ValueError(
+                f"Metric fields conflict with reserved fields: {conflicts}"
+            )
+
+        # Check column presence
+        required_cols = [unique_id] + metric_field_names
+        missing = [col for col in required_cols if col not in df.columns]
+        if missing:
+            available_cols = [col for col in df.columns if col != "geometry"]
+            raise ValueError(
+                f"Missing required columns: {missing}. Available columns: {available_cols}"
+            )
+
+        # Enforce numeric
+        df[metric_field_names] = df[metric_field_names].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        invalid_rows = df[required_cols].isna().any(axis=1)
+
+        if invalid_rows.any():
+            count = invalid_rows.sum()
+            if strict:
+                raise ValueError(f"{count} invalid rows found.")
+            print(f"\u26a0 Dropping {count} invalid rows.")
+            df = df[~invalid_rows]
+
+        result = df.set_index(unique_id) if set_index else df
+        return (
+            GeoDataFrame(result, geometry="geometry", crs=df.crs) if is_geo else result
+        )
+
+    def standardise(
+        self,
+        fields: Optional[list[str]] = None,
+        suffix: str = "z",
+    ) -> pd.DataFrame:
+        """
+        Standardise selected numeric fields (z-score) from a stored result.
+        The z-score is the number of standard deviations a data point is away from the mean
+
+        Args:
+            fields: List of columns to standardise (default: all numeric excluding protected).
+            suffix: Suffix to append to new standardised columns (e.g., "z" → "2020z").
+
+        Returns:
+            DataFrame (or GeoDataFrame) with standardised fields.
+        """
+
+        protected = {self.unique_id_field, self.weighting_field, self.type_field}
+
+        if fields:
+            fields = [str(f) for f in fields]
+            invalid = [f for f in fields if f not in self.data.columns]
+            if invalid:
+                raise ValueError(f"Fields not found in result: {invalid}")
+        else:
+            # Auto-detect numeric fields not protected
+            fields = [
+                col
+                for col in self.data.columns
+                if col not in protected
+                and pd.api.types.is_numeric_dtype(self.data[col])
+            ]
+
+        print(f"Standardizing fields: {fields} (suffix: '{suffix}')")
+
+        # Perform z-score standardization
+        for col in fields:
+            self.data[f"{col}{suffix}"] = (
+                self.data[col] - self.data[col].mean()
+            ) / self.data[col].std()
+
+        print(f"Standardized fields are: {[f'{col}{suffix}' for col in fields]}")
+
+        return self.data
+
+    def normalise(
+        self,
+        fields: Optional[list[str]] = None,
+        suffix: str = "n",
+    ) -> pd.DataFrame:
+        """
+        Normalize selected numeric fields (min-max scaling) from a stored result.
+        i.e. all fields will be rescaled to between 0 and 1.
+
+        Args:
+            fields: List of columns to normalise (default: all numeric excluding protected).
+            suffix: Suffix for normalised output columns (e.g., "n" → "2020n").
+
+        Returns:
+            DataFrame (or GeoDataFrame) with normalised fields.
+        """
+
+        protected = {self.unique_id_field, self.weighting_field, self.type_field}
+
+        if fields:
+            fields = [str(f) for f in fields]
+            invalid = [f for f in fields if f not in self.data.columns]
+            if invalid:
+                raise ValueError(f"Fields not found in result: {invalid}")
+        else:
+            fields = [
+                col
+                for col in self.data.columns
+                if col not in protected
+                and pd.api.types.is_numeric_dtype(self.data[col])
+            ]
+
+        print(f"Normalising fields: {fields} (suffix: '{suffix}')")
+
+        for col in fields:
+            min_val = self.data[col].min()
+            max_val = self.data[col].max()
+            if min_val == max_val:
+                print(f"\u26a0 Skipping {col} — no variation (min = max = {min_val})")
+                continue
+            self.data[f"{col}{suffix}"] = (self.data[col] - min_val) / (
+                max_val - min_val
+            )
+        print(f"Normalised fields are: {[f'{col}{suffix}' for col in fields]}")
+
+        return self.data
+
+    def plot(self) -> None:
+        """
+        Plot the base scale spatial data.
+
+        Args:
+            base_scale: SpatialScale object containing the base data
+            title: Optional title for the plot
+        """
+        ax = self.data.plot(color="lightblue", edgecolor="blue")
+        ax.set_title(f"Base Scale: {self.name}")
+        ax.axis("off")
+        plt.show()
 
 
-def plot_base_scale(base_scale, base_scale_config: dict) -> None:
+def plot_spatial_hierarchy(*args: SpatialScale) -> None:
     """
-    Plot the base scale spatial data.
-    
+    Plot all spatial scales together with thumbnails and overlay plot.
+
     Args:
-        base_scale: SpatialScale object containing the base data
-        base_scale_config: BASE_SCALE configuration dictionary
-    """
-    import matplotlib.pyplot as plt
-    
-    base_scale.data.plot(figsize=(10, 8), color='lightblue', edgecolor='blue')
-    plt.title(f'Base Scale: {base_scale_config["name"]}')
-    plt.show()
+        *args: SpatialScale objects where first is base scale, rest are aggregation scales
 
+    Example:
+        plot_spatial_hierarchy(base_scale, region_scale, basin_scale)
+    """
+    if not args:
+        raise ValueError("At least one SpatialScale object required")
 
-def plot_spatial_hierarchy(base_scale, base_scale_config: dict, agg_scale_objects: dict) -> None:
-    """
-    Plot all spatial scales together with proper legend and extent.
-    
-    Args:
-        base_scale: SpatialScale object containing the base data
-        base_scale_config: BASE_SCALE configuration dictionary
-        agg_scale_objects: Dictionary of aggregation scale objects
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    import matplotlib.cm as cm
-    import numpy as np
-    
-    fig, ax = plt.subplots(figsize=(12, 10))
-    base_scale.data.plot(ax=ax, color='lightblue', alpha=0.6, edgecolor='blue', label=base_scale_config["name"])
-    
-    # Generate colors based on number of aggregation scales
+    base_scale = args[0]
+    agg_scale_objects = list(args[1:])
+
+    def draw_scale(
+        ax, gdf, title=None, facecolor="none", edgecolor="black", lw=1, alpha=0.7
+    ):
+        gdf.plot(ax=ax, color=facecolor, edgecolor=edgecolor, lw=lw, alpha=alpha)
+        if title:
+            ax.set_title(title, fontsize=10)
+        ax.axis("off")
+
+    # Prepare color map for aggregation scales
     n_scales = len(agg_scale_objects)
     colors = cm.Set1(np.linspace(0, 1, n_scales)) if n_scales > 0 else []
-    
-    for i, (name, scale_obj) in enumerate(agg_scale_objects.items()):
-        scale_obj.data.plot(ax=ax, color='none', edgecolor=colors[i], linewidth=2, label=name)
-    
-    # Set axis limits to base scale extent
-    ax.set_xlim(base_scale.data.total_bounds[0], base_scale.data.total_bounds[2])
-    ax.set_ylim(base_scale.data.total_bounds[1], base_scale.data.total_bounds[3])
-    
-    # Create custom legend
-    legend_elements = [Line2D([0], [0], color='lightblue', lw=4, label=base_scale_config["name"])]
-    for i, name in enumerate(agg_scale_objects.keys()):
-        legend_elements.append(Line2D([0], [0], color=colors[i], lw=2, label=name))
-    ax.legend(handles=legend_elements)
-    
-    ax.set_title('Spatial Scale Hierarchy')
+
+    # --------- Thumbnails ----------
+    all_scales = [(base_scale.name, base_scale, "lightblue", "blue", 0.7)]
+    for i, scale_obj in enumerate(agg_scale_objects):
+        all_scales.append((scale_obj.name, scale_obj, "none", colors[i], 1))
+
+    n_thumbs = len(all_scales)
+    fig, axes = plt.subplots(1, n_thumbs, figsize=(2.5 * n_thumbs, 1.25))
+    if n_thumbs == 1:
+        axes = [axes]
+
+    for ax, (name, scale_obj, facecolor, edgecolor, lw) in zip(axes, all_scales):
+        draw_scale(
+            ax,
+            scale_obj.data,
+            title=name,
+            facecolor=facecolor,
+            edgecolor=edgecolor,
+            lw=lw,
+        )
+
+    plt.tight_layout()
     plt.show()
 
+    # --------- Main Overlay Plot ----------
+    fig, ax = plt.subplots(figsize=(10, 8))
 
-def load_metric_from_spatial(base_scale, metric_name: str, unique_id: str) -> pd.DataFrame:
-    """
-    Load metric data directly from spatial data attributes.
-    
-    Args:
-        base_scale: SpatialScale object containing the spatial data
-        metric_name: Name of the attribute column to use as metric
-        unique_id: Name of the unique ID column
-        
-    Returns:
-        DataFrame with unique_id and metric columns
-    """
-    print(f"Loading '{metric_name}' from spatial data...")
-    
-    # Check if metric column exists
-    if metric_name not in base_scale.data.columns:
-        raise ValueError(f"Column '{metric_name}' not found in spatial data.\n"
-                        f"Available columns: {list(base_scale.data.columns)}")
-    
-    # Create DataFrame from spatial data
-    data = base_scale.data[[unique_id, metric_name]].copy()
-    data = data.reset_index(drop=True)
-    
-    # Validate metric column is numeric
-    if not pd.api.types.is_numeric_dtype(data[metric_name]):
-        data[metric_name] = pd.to_numeric(data[metric_name], errors='coerce')
-        nan_count = data[metric_name].isna().sum()
-        if nan_count > 0:
-            print(f"Warning: {nan_count} non-numeric values converted to NaN")
-            data = data.dropna(subset=[metric_name])
-    
-    print(f"Loaded {len(data)} records from spatial data")
-    return data
+    # Base layer
+    draw_scale(
+        ax,
+        base_scale.data,
+        facecolor="lightblue",
+        edgecolor="blue",
+        lw=0.5,
+        alpha=0.6,
+    )
 
+    # Aggregation layers
+    for i, scale_obj in enumerate(agg_scale_objects):
+        draw_scale(
+            ax,
+            scale_obj.data,
+            facecolor="none",
+            edgecolor=colors[i],
+            lw=2,
+            alpha=1.0,
+        )
 
-def assign_functional_group(type_value: str, base_scale_name: str, group_rules: dict, include_unmatched: bool = True) -> Optional[str]:
-    """
-    Assign functional group based on base scale type field using configurable rules.
-    
-    Args:
-        type_value: Type classification string from base scale
-        base_scale_name: Name of the base scale to get appropriate rules
-        group_rules: Dictionary of grouping rules by base scale
-        include_unmatched: If True, return original type_value for unmatched types; if False, return None
-        
-    Returns:
-        Assigned functional group name, original type_value, or None based on configuration
-    """
-    if base_scale_name not in group_rules:
-        return None
+    # Set axis to base extent
+    bounds = base_scale.data.total_bounds
+    ax.set_xlim(bounds[0], bounds[2])
+    ax.set_ylim(bounds[1], bounds[3])
 
-    type_lower = type_value.lower()
-    scale_rules = group_rules[base_scale_name]
+    # Legend
+    legend_elements = [Line2D([0], [0], color="lightblue", lw=4, label=base_scale.name)]
+    for i, scale_obj in enumerate(agg_scale_objects):
+        legend_elements.append(
+            Line2D([0], [0], color=colors[i], lw=2, label=scale_obj.name)
+        )
 
-    # Check each group - convert keywords to lowercase for case-insensitive matching
-    for group_name, keywords in scale_rules.items():
-        keywords_lower = [keyword.lower() for keyword in keywords]
-        if any(keyword in type_lower for keyword in keywords_lower):
-            return group_name
-
-    # Handle unmatched types based on configuration
-    return type_value if include_unmatched else None
+    ax.legend(loc="upper left", handles=legend_elements)
+    ax.set_title("Spatial Scale Hierarchy")
+    plt.show()
