@@ -1,0 +1,18 @@
+# Custom Dictionary Words
+edgecolor
+facecolor
+figsize
+fontsize
+geospatial
+gpkg
+GPKG
+isin
+NDVI
+reclass
+Reclass
+rmap
+shapefiles
+sjoin
+usecols
+xlim
+ylim
