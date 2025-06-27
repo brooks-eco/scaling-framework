@@ -20,7 +20,7 @@ This framework aggregates ecological data from fine-scale base units (sites) to 
 ```python
 BASE_SCALE = {
     "aggregation_method": "geometry",  # Uses area weighting for polygons
-    "measure_field": "Area_Ha"  # Optional - auto-calculated if not provided
+    "weighting_field": "Area_Ha"  # Optional - auto-calculated if not provided
 }
 ```
 
@@ -36,7 +36,7 @@ BASE_SCALE = {
 ```python
 BASE_SCALE = {
     "aggregation_method": "geometry",  # Uses length weighting for lines
-    "measure_field": "Length_km"  # Optional - auto-calculated if not provided
+    "weighting_field": "Length_km"  # Optional - auto-calculated if not provided
 }
 ```
 
@@ -54,7 +54,7 @@ BASE_SCALE = {
     "aggregation_method": "count",  # Each feature counts as 1
     # OR
     "aggregation_method": "sum",   # Sum attribute values
-    "measure_field": "SpeciesCount"
+    "weighting_field": "SpeciesCount"
 }
 ```
 
@@ -179,7 +179,7 @@ BASE_SCALE = {
     "name": "ObservationSites",
     "file": "species_points.shp",
     "unique_id": "SiteID", 
-    "measure_field": "SpeciesCount",
+    "weighting_field": "SpeciesCount",
     "type_field": "HabitatType",  # Optional - for grouping
     "aggregation_method": "sum"  # Sum species across sites
 }
@@ -192,7 +192,7 @@ BASE_SCALE = {
     "name": "RiverSegments", 
     "file": "river_lines.shp",
     "unique_id": "SegmentID",
-    "measure_field": "Length_km",
+    "weighting_field": "Length_km",
     "type_field": "StreamOrder",  # Optional - for grouping
     "aggregation_method": "geometry"  # Length-weighted aggregation
 }
@@ -205,7 +205,7 @@ BASE_SCALE = {
     "name": "VegetationPatches",
     "file": "habitat_polygons.shp", 
     "unique_id": "PatchID",
-    "measure_field": "Area_Ha",
+    "weighting_field": "Area_Ha",
     "type_field": "VegetationType",  # Optional - for grouping
     "aggregation_method": "geometry"  # Area-weighted aggregation
 }

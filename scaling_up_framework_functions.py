@@ -55,7 +55,7 @@ class SpatialScale:
         self,
         name: str,
         source: Union[str, Path],
-        unique_id_field: Union[str, List[str]],
+        unique_id_fields: Union[str, List[str]],
         weighting_field: Optional[str] = None,
         metric_fields: Optional[List[str]] = None,
         measure_multiplier: Optional[float] = None,
@@ -75,7 +75,7 @@ class SpatialScale:
         Parameters explained in plain English:
             name: A short name for this scale (used in output files)
             source: Path to your shapefile
-            unique_id_field: Column that uniquely identifies each feature
+            unique_id_fields: One or more columns that uniquely identify each feature
             weighting_field: Column containing size/importance measure (or None to auto-calculate)
             metric_fields: List of columns containing measures to be used for analysis
             measure_multiplier: Number to multiply measures by (usually leave as None)
@@ -93,16 +93,19 @@ class SpatialScale:
                 f"Please check that the file exists and the path is correct."
             )
 
-        # Store unique_id as string (convert from list if needed)
-        self.unique_id_field = (
-            unique_id_field if isinstance(unique_id_field, str) else unique_id_field[0]
+        # Store unique_id as LIST (convert from string if needed)
+        self.unique_id_fields = (
+            [unique_id_fields]
+            if isinstance(unique_id_fields, str)
+            else unique_id_fields
         )
 
         # -----------------------------------------------------
         # Determine which columns are required from the shapefile
         # Only load what we need to make processing faster
         # -----------------------------------------------------
-        required_cols = {self.unique_id_field}
+        required_cols = set()
+        required_cols.update(self.unique_id_fields)
         if weighting_field:
             required_cols.add(weighting_field)
         if type_field:
@@ -136,11 +139,11 @@ class SpatialScale:
             gpd.read_file(self.source).to_crs(self.default_crs), fix_invalid=True
         )
 
-        # Convert columns to strings (if not already)
-        self.data.columns = self.data.columns.map(str)
+        # # Convert columns to strings (if not already)
+        # self.data.columns = self.data.columns.map(str) # now in validate_metric_columns
 
-        # Convert required_cols to strings to match DataFrame columns
-        required_cols = [str(c) for c in required_cols]
+        # # Convert required_cols to strings to match DataFrame columns
+        # required_cols = [str(c) for c in required_cols] # now in validate_metric_columns
 
         # Select columns based on whether metric_fields is specified
         if metric_fields:
@@ -152,38 +155,48 @@ class SpatialScale:
         print(f"   Loaded: {cols}")
         # If metric_fields is None, retain all columns (no filtering)
 
-        # Handle complex geometries by breaking them into simple parts
-        # E.g., a MultiPolygon becomes multiple separate Polygons
-        # This ensures each feature is treated as a separate unit for analysis
         multi_geom_count = self.data.geometry.geom_type.isin(
             ["MultiPolygon", "MultiLineString", "MultiPoint"]
         ).sum()
-        if multi_geom_count > 0:
+        if multi_geom_count:
             print(
-                f"   Breaking {multi_geom_count} complex geometries into simple parts..."
+                f"   Found {multi_geom_count} multi-part geometries in {self.name} data.  Calculations will proceed OK. Just letting you know!  "
             )
-            self.data = self.data.explode(index_parts=False).reset_index(drop=True)
+        # commented out explode logic but retained for future reference
+        # # Handle complex geometries by breaking them into simple parts
+        # # E.g., a MultiPolygon becomes multiple separate Polygons
+        # # This ensures each feature is treated as a separate unit for analysis
+        # if multi_geom_count > 0:
+        #     print(
+        #         f"   Breaking {multi_geom_count} complex geometries into simple parts..."
+        #     )
+        #     self.data = self.data.explode(index_parts=False).reset_index(drop=True)
 
-        # Check that all required columns exist in the shapefile
-        missing_cols = [c for c in required_cols if c not in self.data.columns]
-        if missing_cols:
-            raise ValueError(
-                f"Required columns {missing_cols} not found in {source}\n"
-                f"Available columns: {list(self.data.columns)}\n"
-                f"Please check your column names in config.py"
-            )
+        # # Check that all required columns exist in the shapefile
+        # now in validate_metric_columns
+        # missing_cols = [c for c in required_cols if c not in self.data.columns]
+        # if missing_cols:
+        #     raise ValueError(
+        #         f"Required columns {missing_cols} not found in {source}\n"
+        #         f"Available columns: {list(self.data.columns)}\n"
+        #         f"Please check your column names in config.py"
+        #     )
 
         # Automatically detect what type of geometry this shapefile contains
         # This determines how we calculate measures and perform aggregation
-        first_geom = self.data.geometry.iloc[0]
-        if first_geom.geom_type == "Polygon":
-            geometry_type = "polygon"  # Areas (wetlands, habitats, management units)
-        elif first_geom.geom_type == "LineString":
-            geometry_type = "line"  # Linear features (rivers, transects, corridors)
-        elif first_geom.geom_type == "Point":
-            geometry_type = "point"  # Point locations (monitoring sites, observations)
+        all_types = set(self.data.geometry.geom_type.unique())
+        valid_polygon = all_types <= {"Polygon", "MultiPolygon"}
+        valid_line = all_types <= {"LineString", "MultiLineString"}
+        valid_point = all_types <= {"Point", "MultiPoint"}
+
+        if valid_polygon:
+            geometry_type = "polygon"
+        elif valid_line:
+            geometry_type = "line"
+        elif valid_point:
+            geometry_type = "point"
         else:
-            raise ValueError(f"Unsupported geometry type: {first_geom.geom_type}")
+            raise ValueError(f"Inconsistent or unsupported geometry types: {all_types}")
 
         print(f"   Detected geometry type: {geometry_type} ({len(self.data)} features)")
 
@@ -211,6 +224,16 @@ class SpatialScale:
         self.type_field = (
             type_field  # Optional field for type-based grouping/reclassification
         )
+
+        # Centralized validation of metrics and UID uniqueness
+        self.data = self._validate_metric_data(
+            self.data,
+            unique_id=self.unique_id_fields,
+            metric_field_names=self.metric_fields,
+            not_allowed=[self.weighting_field, self.type_field],
+            set_index=False,
+        )
+
         self.geometry_type = geometry_type
         self._join_cache = {}  # Cached spatial join results
         self.results = {}  # Stores aggregation results keyed by result name
@@ -285,7 +308,7 @@ class SpatialScale:
     def join_data(
         self,
         data_path: Union[str, Path],
-        tabular_data_unique_id_field: Optional[str] = None,
+        tabular_data_unique_id_fields: Optional[Union[str, List]] = None,
         pivot_row_id: Optional[List[str]] = None,
         pivot_columns: Optional[str] = None,
         pivot_values: Optional[str] = None,
@@ -300,7 +323,7 @@ class SpatialScale:
 
         Args:
             data_path: Path to the CSV or tabular data file.
-            unique_id_field: Column in the CSV matching source unique ID. If None, defaults to self.unique_id.
+            unique_id_fields: Column in the CSV matching source unique ID. If None, defaults to self.unique_id.
             pivot_index: If pivoting, list of columns to use as index.
             pivot_columns: If pivoting, column name whose values become new columns.
             pivot_values: If pivoting, column name containing values to fill.
@@ -313,21 +336,33 @@ class SpatialScale:
         # Load CSV data
         tabular_data = pd.read_csv(data_path)
 
-        # Determine the ID field to use
-        if tabular_data_unique_id_field is None:
-            tabular_data_unique_id_field = self.unique_id_field
+        # Determine the ID field to use fall back to unique_id_fields
+
+        tabular_data_unique_id_fields = (
+            [tabular_data_unique_id_fields]
+            if isinstance(tabular_data_unique_id_fields, str)
+            else tabular_data_unique_id_fields or self.unique_id_fields
+        )
+
+        # if not tabular_data_unique_id_fields:
+        #     tabular_data_unique_id_fields = self.unique_id_fields
 
         pivot_row_id = [pivot_row_id] if isinstance(pivot_row_id, str) else pivot_row_id
 
-        # Check unique_id field exists
-        if tabular_data_unique_id_field not in tabular_data.columns:
-            raise ValueError(
-                f"unique_id_field '{tabular_data_unique_id_field}' not found in data columns: {list(tabular_data.columns)}"
-            )
-        if (
-            not pivot_row_id
-            and tabular_data[tabular_data_unique_id_field].duplicated().any()
+        # Check all unique_id fields exist in the DataFrame columns
+        if not all(
+            field in tabular_data.columns for field in tabular_data_unique_id_fields
         ):
+            raise ValueError(
+                f"unique_id_fields '{tabular_data_unique_id_fields}' not found in data columns: {list(tabular_data.columns)}"
+            )
+
+        # look for duplicate rows with same tabular_data_unique_id_fields (which may be a list) as indictor
+        # data is in long format and needs to be pivoted
+        duplicated_mask = tabular_data.duplicated(
+            subset=tabular_data_unique_id_fields, keep=False
+        )
+        if not pivot_row_id and duplicated_mask.any():
             print(
                 "\u26a0 Warning: Duplicate IDs found in tabular data. Consider pivoting?"
             )
@@ -352,7 +387,7 @@ class SpatialScale:
         # ensure all column headers are strings
         tabular_data_clean = self._validate_metric_data(
             tabular_data,
-            self.unique_id_field,
+            unique_id=self.unique_id_fields,
             not_allowed=[self.weighting_field, self.type_field],
         )
 
@@ -360,14 +395,14 @@ class SpatialScale:
         self.data = self.data.merge(
             tabular_data_clean,
             how=how,
-            left_on=self.unique_id_field,
-            right_on=tabular_data_unique_id_field,
+            left_on=self.unique_id_fields,
+            right_on=tabular_data_unique_id_fields,
             suffixes=("", "_external"),
             validate="one_to_one",
         )
 
         print(
-            f"Joined external data from {data_path} on '{tabular_data_unique_id_field}'"
+            f"Joined external data from {data_path} on '{tabular_data_unique_id_fields}'"
         )
 
     def spatial_join(
@@ -402,12 +437,17 @@ class SpatialScale:
                 )
                 target_scale.data = target_scale.data.rename(columns=rename_map)
 
-            # Update target's unique_id field if it was renamed
-            updated_uid = rename_map.get(target_scale.unique_id_field)
-            if updated_uid:
-                target_scale.unique_id_field = updated_uid
+            # Update target's unique_id fields (noting uid is a list) if renamed
+            # Handle compound key (list of fields)
+            updated_uids = [
+                rename_map.get(uid, uid) for uid in target_scale.unique_id_fields
+            ]
+
+            # If any field was renamed, update the unique_id_field
+            if updated_uids != target_scale.unique_id_fields:
+                target_scale.unique_id_fields = updated_uids
                 print(
-                    f"\u26a0 Warning: Updated target scale unique_id_field to '{updated_uid}'"
+                    f"\u26a0 Warning: Updated target scale unique_id_field to '{updated_uids}'"
                 )
 
             # Run the spatial join (inner join only, to maintain overlaps)
@@ -428,7 +468,7 @@ class SpatialScale:
         reclass_map: dict[str, str] = None,
         group_by: list[str] = None,
         result_name: str = None,
-        keep_unmatched: bool = True,
+        keep_unmatched_types: bool = True,
         weighting_field: Optional[str] = None,
     ) -> pd.DataFrame:
         """
@@ -454,36 +494,75 @@ class SpatialScale:
         Returns:
             DataFrame: Aggregated result (without geometry).
         """
+        if "regrouped" in df.columns:
+            print("⚠️  'regrouped' column already exists before aggregation starts")
+
         df = df.copy()
+
+        # Remove duplicate columns before proceeding
+        if df.columns.duplicated().any():
+            print(
+                "\u26a0 Warning: Duplicate columns found in input DataFrame. Cleaning up."
+            )
+        df = df.loc[:, ~df.columns.duplicated()]
+
         weight_field = weighting_field or self.weighting_field
         metric_columns = [str(col) for col in (metric_columns or [])]
 
-        # --- Handle type reclassification ---
+        # --- Handle type reclassification with substring matching ---
         reclass_field = None
         if reclass_map and self.type_field:
             print(
-                f"Reclassifying '{self.type_field}' into new groups '_grp_' using supplied reclass map..."
+                f"Reclassifying '{self.type_field}' into new groups 'regrouped' using substring match from reclass map..."
             )
-            flat_map = {
-                t: g
-                for g, types in reclass_map.items()
-                for t in (types if isinstance(types, (list, set, tuple)) else [types])
-            }
-            df["_grp_"] = df[self.type_field].map(flat_map)
-            unmatched = df[df["_grp_"].isna()][self.type_field].unique()
+
+            # Remove old regrouped column if it exists
+            if "regrouped" in df.columns:
+                df.drop(columns="regrouped", inplace=True)
+                print(
+                    "\u26a0 Warning: removed existing 'regrouped' column and re-applying group rules."
+                )
+
+            def match_reclass(value):
+                for group, substrings in reclass_map.items():
+                    for substr in substrings:
+                        if (
+                            substr.lower() in str(value).lower()
+                        ):  # Case-insensitive match
+                            return group
+                return None
+
+            # Apply the reclassification mapping
+            # This creates a new column 'regrouped' with matched groups or NaN if no match
+            df["regrouped"] = df[self.type_field].apply(match_reclass)
+
+            # Handle unmatched types
+            unmatched = df[df["regrouped"].isna()][self.type_field].unique()
             if len(unmatched) > 0:
-                if not keep_unmatched:
-                    df = df[~df["_grp_"].isna()].copy()
-                    print(f"Dropped {len(unmatched)} unmatched types")
+                if not keep_unmatched_types:
+                    df = df[~df["regrouped"].isna()].copy()
+                    print(
+                        f"Dropped {len(unmatched)} types that did not match any re-grouping rules."
+                        f"Keeping {len(df)} re-grouped rows.\n"
+                        f"Set option 'keep_unmatched_types=True' to retain unmatched types."
+                    )
                 else:
-                    print(f"Retained {len(unmatched)} unmatched types")
-            df["_grp_"] = df["_grp_"].fillna(df[self.type_field])
-            reclass_field = "_grp_"
+                    # Fill in original type_field values for unmatched rows
+                    df["regrouped"] = df["regrouped"].fillna(df[self.type_field])
+                    print(
+                        f"Retained {len(unmatched)} original types that did not match any re-grouping rules"
+                        f"Set option 'keep_unmatched_types=False' to drop these rows."
+                    )
+
+            reclass_field = "regrouped"
+
         elif self.type_field:
             reclass_field = self.type_field
-
+        print(f"target_scale.unique_id_fields {target_scale.unique_id_fields}")
         # --- Grouping keys ---
-        group_keys = [target_scale.unique_id_field]
+        group_keys = (
+            target_scale.unique_id_fields.copy()
+        )  # Start with target scale's unique ID fields - use copy because it is a list
         if reclass_field:
             group_keys.append(reclass_field)
         if group_by:
@@ -497,8 +576,8 @@ class SpatialScale:
                 raise ValueError("frequency_weighted requires a type or reclass field")
 
             freq = df.groupby(group_keys).size().rename("freq")
-            total = freq.groupby(target_scale.unique_id_field).sum().rename("total")
-            weights = freq.to_frame().join(total, on=target_scale.unique_id_field)
+            total = freq.groupby(target_scale.unique_id_fields).sum().rename("total")
+            weights = freq.to_frame().join(total, on=target_scale.unique_id_fields)
             weights["weight"] = weights["freq"] / weights["total"]
             df = df.join(weights["weight"], on=group_keys)
 
@@ -620,7 +699,7 @@ class SpatialScale:
         reclass_map: dict[str, str] = None,
         group_by: list[str] = None,
         result_name: str = None,
-        keep_unmatched: bool = True,
+        keep_unmatched_types: bool = True,
         how: str = "intersects",
         weighting_field: Optional[str] = None,
     ) -> GeoDataFrame:
@@ -675,7 +754,7 @@ class SpatialScale:
         # Validate metric columns in this scale
         self._validate_metric_data(
             self.data,
-            unique_id=self.unique_id_field,
+            unique_id=self.unique_id_fields,
             metric_field_names=metric_columns,
             not_allowed=[self.type_field, self.weighting_field] + (group_by or []),
         )
@@ -699,7 +778,7 @@ class SpatialScale:
             reclass_map=reclass_map,
             group_by=group_by,
             result_name=result_name,
-            keep_unmatched=keep_unmatched,
+            keep_unmatched_types=keep_unmatched_types,
             weighting_field=weighting_field,
         )
 
@@ -753,12 +832,12 @@ class SpatialScale:
                     f"Invalid file type: {ext}. Valid types: {', '.join(valid_types)}"
                 )
 
-        # Get base geometry for join
-        geometry_df = self.data[[self.unique_id_field, "geometry"]]
+        # Get base geometry for join (protecting unique_id_fields list )
+        geometry_df = self.data[self.unique_id_fields + ["geometry"]]
 
         for result_name, result_df in self.results.items():
             # Join geometry on demand
-            full_df = geometry_df.merge(result_df, on=self.unique_id_field, how="left")
+            full_df = geometry_df.merge(result_df, on=self.unique_id_fields, how="left")
 
             # Clean column names (remove _target if possible)
             rename_map = {
@@ -787,7 +866,7 @@ class SpatialScale:
     def _validate_metric_data(
         self,
         df: pd.DataFrame,
-        unique_id: str = None,
+        unique_id: Union[str, List[str]] = None,
         metric_field_names: Optional[Union[str, list]] = None,
         not_allowed: Optional[list] = None,
         strict: bool = False,
@@ -802,7 +881,7 @@ class SpatialScale:
             metric_field_names: Metric fields to validate. If None, infer from numeric fields.
             group_by: Optional grouping fields to exclude from metrics.
             strict: If True, raise if non-numeric or missing values are found.
-            set_index: If True, set index to self.unique_id_field.
+            set_index: If True, set index to self.unique_id_fields.
 
         Returns:
             Cleaned DataFrame or GeoDataFrame with validated numeric metrics.
@@ -812,15 +891,26 @@ class SpatialScale:
 
         # Normalize columns
         df.columns = df.columns.map(str)
-        unique_id = unique_id or self.unique_id_field
+        unique_id = (
+            [unique_id]
+            if isinstance(unique_id, str)
+            else unique_id or self.unique_id_fields
+        )
         reserved = {
-            unique_id,
+            # unique_id,
             self.weighting_field,
             self.type_field,
             *(not_allowed or []),
         }
+        reserved.update(unique_id)
 
-        if metric_field_names is None:
+        (
+            [metric_field_names]
+            if isinstance(metric_field_names, str)
+            else metric_field_names
+        )
+
+        if not metric_field_names:
             metric_field_names = [
                 col
                 for col in df.columns
@@ -840,7 +930,7 @@ class SpatialScale:
             )
 
         # Check column presence
-        required_cols = [unique_id] + metric_field_names
+        required_cols = unique_id + metric_field_names
         missing = [col for col in required_cols if col not in df.columns]
         if missing:
             available_cols = [col for col in df.columns if col != "geometry"]
@@ -858,8 +948,29 @@ class SpatialScale:
             count = invalid_rows.sum()
             if strict:
                 raise ValueError(f"{count} invalid rows found.")
-            print(f"\u26a0 Dropping {count} invalid rows.")
             df = df[~invalid_rows]
+            print(
+                f"\u26a0 Dropping {count} invalid rows (missing values or not numeric). {len(df)} rows remain."
+            )
+
+        # Enforce uniqueness of unique_id (can be multiple columns)
+        duplicated_mask = df.duplicated(subset=unique_id, keep=False)
+        if duplicated_mask.any():
+            dup_rows = df[duplicated_mask]
+            dup_keys = dup_rows[unique_id].drop_duplicates()
+
+            # Format each duplicate key nicely
+            formatted_keys = "\n".join(
+                "- " + ", ".join(str(val) for val in row) for row in dup_keys.values
+            )
+
+            msg = (
+                f"Duplicate compound keys found in columns: {unique_id}.\n"
+                f"Each combination of values must be unique across rows (order matters).\n"
+                f"Examples of duplicates:\n{formatted_keys}"
+            )
+            print(msg)
+            raise ValueError(msg)
 
         result = df.set_index(unique_id) if set_index else df
         return (
@@ -883,7 +994,7 @@ class SpatialScale:
             DataFrame (or GeoDataFrame) with standardised fields.
         """
 
-        protected = {self.unique_id_field, self.weighting_field, self.type_field}
+        protected = {self.unique_id_fields, self.weighting_field, self.type_field}
 
         if fields:
             fields = [str(f) for f in fields]
@@ -928,7 +1039,7 @@ class SpatialScale:
             DataFrame (or GeoDataFrame) with normalised fields.
         """
 
-        protected = {self.unique_id_field, self.weighting_field, self.type_field}
+        protected = {self.unique_id_fields, self.weighting_field, self.type_field}
 
         if fields:
             fields = [str(f) for f in fields]
@@ -958,7 +1069,12 @@ class SpatialScale:
 
         return self.data
 
-    def plot(self) -> None:
+    def plot(
+        self,
+        result: str = None,
+        field: str = None,
+        color_range: Optional[List[float]] = None,
+    ) -> None:
         """
         Plot the base scale spatial data.
 
@@ -966,7 +1082,48 @@ class SpatialScale:
             base_scale: SpatialScale object containing the base data
             title: Optional title for the plot
         """
-        ax = self.data.plot(color="lightblue", edgecolor="blue")
+        print(f"Plotting {self.name}...")
+        if result and result in self.results.keys():
+            result_df = self.results[result].copy()
+            geometry_df = self.data[self.unique_id_fields + ["geometry"]]
+            df = geometry_df.merge(result_df, on=self.unique_id_fields, how="left")
+            # Clean column names (remove _target if possible)
+            rename_map = {
+                col: col.replace("_target", "")
+                for col in df.columns
+                if col.endswith("_target")
+                and col.replace("_target", "") not in df.columns
+            }
+            if rename_map:
+                df.rename(columns=rename_map, inplace=True)
+                print(df)
+        else:
+            print(
+                f"Result not found. Using {self.name} data. Saved results are {self.results.keys()}"
+            )
+            df = self.data
+
+        if field is None or field not in df.columns:
+            print(
+                f"{field} not found in the data or not provided. Plotting with default color."
+                f"Available fields: {df.columns.tolist()}"
+            )
+            ax = self.data.plot(color="lightblue", edgecolor="blue")
+        else:
+            plot_kwargs = {
+                "column": field,
+                "cmap": "viridis",
+                "edgecolor": "black",
+                "legend": True,
+            }
+
+            if color_range and isinstance(color_range, list) and len(color_range) == 2:
+                plot_kwargs["vmin"] = color_range[0]
+                plot_kwargs["vmax"] = color_range[1]
+                print(f"Using fixed color range: {color_range}")
+
+            ax = df.plot(**plot_kwargs)
+
         ax.set_title(f"Base Scale: {self.name}")
         ax.axis("off")
         plt.show()
@@ -987,6 +1144,10 @@ def plot_spatial_hierarchy(*args: SpatialScale) -> None:
 
     base_scale = args[0]
     agg_scale_objects = list(args[1:])
+
+    print(
+        f"Plotting {base_scale.name} with {len(agg_scale_objects)} aggregation scales..."
+    )
 
     def draw_scale(
         ax, gdf, title=None, facecolor="none", edgecolor="black", lw=1, alpha=0.7
