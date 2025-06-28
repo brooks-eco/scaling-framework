@@ -1,4 +1,4 @@
-# Murray-Darling Basin Scaling-up Framework
+# Generic Scaling-up Framework
 
 A framework for hierarchical data aggregation across spatial scales with a specific focus on scaling up the evaluation of rivers, wetlands and floodplains within large river systems like the Murray-Darling Basin.
 
