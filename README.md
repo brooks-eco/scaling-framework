@@ -4,14 +4,16 @@ A framework for hierarchical data aggregation across spatial scales with a speci
 
 ## Overview
 
-The Scaling-up Framework addresses a fundamental challenge in landscape ecology: **how to transfer ecological information across spatial scales while preserving biological relevance and statistical validity**.
+A fundamental challenge in landscape ecology is **how to transfer ecological information across spatial scales while preserving biological relevance and statistical validity**.
 
-This framework:
+This framework is a code library developed as a small research project within the [Flow-MER project](https://www.flow-mer.org.au/)
 
-- Aggregate fine-resolution ecological data to management-relevant scales
+The framework is used to:
+
+- Aggregate fine-resolution ecological data to larger management-relevant scales
 - Maintains ecological meaning through appropriate weighting schemes
 - Handles complex spatial hierarchies common in landscape ecology
-- Ensure statistical rigor in multi-scale analyses
+- Ensure statistical rigor in calculation of weighted metrics to summaries larger areas from smaller scale building blocks.
 
 ### The Scale Challenge
 
@@ -42,7 +44,7 @@ Issues of scale complicate the study and management of natural systems because:
 
 ### Aggregation Challenges
 
-Simply averaging fine-scale data to broader scales can be **ecologically misleading** because:
+Averaging fine-scale data to broader scales can be **ecologically misleading** because of:
 
 1. **Unequal representation**: Large habitats should influence regional patterns more than small ones
 2. **Functional differences**: Different habitat types contribute differently to ecosystem services
@@ -51,12 +53,13 @@ Simply averaging fine-scale data to broader scales can be **ecologically mislead
 
 ## This Framework
 
-The code uses spatial data sets (shapefiles or geopackages)  to construct a spatial hierarchies.
-Data attached to the smallest scale features (the atomic building blocks) are then applied to larger scales (using spatial joins) and weighted averages.
+The code uses spatial data sets (shapefiles or geopackages) and frames the spatial relationships between (e.g. smaller patches within larger regions).
+Data attached to the smallest scale features (the building blocks) are then applied to larger scales using spatial joins and weighted averages.
+Larger scales can then be aggregated up the chain to even larger scales - e.g. wetlands -> catchments -> whole river basin
 
 ### Metric aggregation
 
-Uses common weighting schemes that leverage the weighted mean formula
+Metric aggregation from small scales to larger scales leverages the `weighted mean formula` in different ways.
 
 ```[]
         Aggregated_Value = Σ(Metric_i × Weight_i) / Σ(Weight_i)
@@ -98,9 +101,21 @@ Uses common weighting schemes that leverage the weighted mean formula
 
 refer included jupyter notebooks.
 
-`test_framework.ipynb` will install simple test data and run through some example calculations and plots.
+`test_framework.ipynb` will install simple generated test data and run through some example calculations and plots.  This should run out of the box.  The helper script `create_test_data.py` generates some simple rectangles (small rectangles within larger rectangles) and includes examples of:
 
-`scaling_framework.ipynb` is an application of the framework in the Murray-Darling Basin to scale up from ANAE ecosystem polygons to larger scales represented by Ramsar sites, Directory of Important Wetlands (DIWA), Valleys, and Northern and Southern Basin regions
+- using a reclass_map to reclassify the types
+- plotting the spatial hierarchy
+- loading some extra data from CSV
+- calculating area and frequency weighted averages from the base scale up to region scale
+- visualising the results
+
+WORK IN PROGRESS - `scaling_framework.ipynb` is an application of the framework in the Murray-Darling Basin to scale up from ANAE ecosystem polygons to larger scales represented by Ramsar sites, Directory of Important Wetlands (DIWA), Valleys, and Northern and Southern Basin regions.
+The source data sets are large and not included in this repository
+
+- Brooks S (2021) Australian National Aquatic Ecosystem (ANAE) Classification of the Murray-Darling Basin v3.0. Wetland Polygons. Accessed 16 May 2023, [https://fed.dcceew.gov.au/datasets/1e57385ab8374f51b4b518a8cf571dbc/about](https://fed.dcceew.gov.au/datasets/1e57385ab8374f51b4b518a8cf571dbc/about)
+- DAWE (2020) Ramsar Wetlands of Australia. Accessed 26 February 2021, [http://www.environment.gov.au/fed/catalog/search/resource/details.page?uuid=%7BF49BFC55-4306-4185-85A9-A5F8CD2380CF%7D](http://www.environment.gov.au/fed/catalog/search/resource/details.page?uuid=%7BF49BFC55-4306-4185-85A9-A5F8CD2380CF%7D)
+- MDBA (2018) Basin-Wide Environmental Watering Strategy Regions for Vegetation Outcomes. Accessed 29 June 2025, [https://data.gov.au/data/dataset/basin-wide-environmental-watering-strategy-regions-for-vegetation-outcomes](https://data.gov.au/data/dataset/basin-wide-environmental-watering-strategy-regions-for-vegetation-outcomes).
+- DIWA Directory of Important Wetlands, polygon shapefile (doesn't seem to be accessible any more), [https://www.dcceew.gov.au/water/wetlands/australian-wetlands-database](https://www.dcceew.gov.au/water/wetlands/australian-wetlands-database)
 
 ## Requirements
 
@@ -123,7 +138,7 @@ Open Source  - Creative Commons v4 with attribution CCby4
 
 Citation:
 
-`Brooks (2025). MDB Scaling-up Framework: Flow-MER Program. Commonwealth Environmental Water Holder, Australian Government Department of Climate Change, Energy, the Environment and Water. Sourced from <github URL>`
+Brooks (2025). MDB Scaling-up Framework: Flow-MER Program. Commonwealth Environmental Water Holder, Australian Government Department of Climate Change, Energy, the Environment and Water. Sourced from [https://github.com/brooks-eco/scaling-framework](https://github.com/brooks-eco/scaling-framework)
 
 Shane Brooks
 
