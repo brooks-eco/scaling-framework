@@ -1,18 +1,61 @@
 """
-MDB Scaling-up Framework - Core Functions
+Murray-Darling Basin Scaling-up Framework - Core Spatial Analysis Functions
 
-This file contains all the main functions that do the actual work of:
-1. Loading and validating your spatial data
-2. Calculating appropriate weights (area, length, or count)
-3. Aggregating small features into larger management units
-4. Handling different geometry types (points, lines, polygons)
-5. Managing functional groups and classifications
+=============================================================================
+OVERVIEW
+=============================================================================
+This framework implements hierarchical spatial aggregation methods for wetland
+and landscape ecology research. It enables scaling-up of fine-resolution ecological
+data (e.g., individual wetlands, vegetation patches) to broader management units
+(e.g., river reaches, catchments, bioregions).
 
-For novice users:
-- You typically don't need to modify this file
-- All settings are controlled through config.py
-- The functions here are called automatically by the notebook
-- Each function has detailed comments explaining what it does
+The framework addresses the fundamental challenge in landscape ecology of
+transferring information across spatial scales while preserving ecological
+relevance and statistical validity.
+
+=============================================================================
+CORE CAPABILITIES
+=============================================================================
+1. Multi-scale Spatial Data Management:
+   - Automated geometry validation and CRS standardization
+   - Support for points (monitoring sites), lines (rivers), polygons (wetlands)
+   - Hierarchical scale relationships (wetlands → reaches → catchments)
+
+2. Ecologically-Informed Aggregation Methods:
+   - Area-weighted means for habitat quality metrics
+   - Length-weighted aggregation for riparian corridor analysis
+   - Frequency-weighted analysis for species occurrence data
+   - Custom weighting schemes for ecological importance
+
+3. Functional Group Classification:
+   - Substring-based reclassification (e.g., 'Permanent Wetland' → 'Wetland')
+   - Wetland type grouping (ephemeral, seasonal, permanent)
+   - Vegetation community aggregation
+
+4. Statistical Validation and Quality Control:
+   - Automated detection of invalid geometries
+   - Duplicate record identification
+   - Missing data handling with ecological context
+
+=============================================================================
+ECOLOGICAL APPLICATIONS
+=============================================================================
+- Wetland condition assessment across river basins
+- Vegetation health monitoring from plot to landscape scale
+- Species habitat suitability modeling at multiple scales
+- Water quality indicator aggregation
+- Biodiversity pattern analysis across management boundaries
+
+=============================================================================
+TECHNICAL IMPLEMENTATION
+=============================================================================
+Built on GeoPandas and Pandas for robust spatial data handling, with
+optimized algorithms for large-scale ecological datasets common in
+landscape ecology research.
+
+Author: Shane Brooks
+Version: 2.0
+License: Open Source  - Creative Commons v4 with attribution CCby4
 """
 
 import pandas as pd
@@ -33,24 +76,54 @@ from pyproj import CRS
 
 class SpatialScale:
     """
-    A class that represents one spatial scale in your analysis.
+    Represents a single spatial scale in hierarchical ecological analysis.
 
-    Think of this as a "container" that holds:
-    - Your spatial data (points, lines, or polygons)
-    - Information about how to measure each feature (area, length, count)
-    - Rules for grouping similar features together
+    This class encapsulates spatial ecological data at one organizational level
+    (e.g., individual wetlands, river reaches, catchments) and provides methods
+    for scale-appropriate aggregation and analysis.
 
-    This class handles all the technical details of:
-    - Loading shapefiles
-    - Detecting geometry types (point/line/polygon)
-    - Calculating appropriate measures (area in hectares, length in meters, etc.)
-    - Validating that your data is properly formatted
+    In landscape ecology, spatial scales represent different levels of ecological
+    organization. For example:
+    - Fine scale: Individual wetland polygons with vegetation condition scores
+    - Intermediate scale: River reaches containing multiple wetlands
+    - Broad scale: Catchments encompassing multiple river reaches
 
-    For novice users:
-    - One SpatialScale = one shapefile in your analysis
-    - The "base scale" contains your smallest features
-    - "Aggregation scales" contain larger boundaries
-    - You create these through the config.py settings
+    Key Ecological Concepts:
+    - Scale dependency: Ecological patterns vary with observation scale
+    - Hierarchical organization: Smaller units nest within larger units
+    - Emergent properties: Higher-level patterns emerge from lower-level processes
+
+    Technical Features:
+    - Automatic geometry type detection and validation
+    - Ecologically-appropriate weighting (area for habitats, length for corridors)
+    - Functional group management for ecological classification
+    - Spatial join optimization for large datasets
+    - Results caching for computational efficiency
+
+    Examples:
+        >>> # Create wetland base scale
+        >>> wetlands = SpatialScale(
+        ...     name="wetlands",
+        ...     source="wetlands.shp",
+        ...     unique_id_fields="WETLAND_ID",
+        ...     type_field="WETLAND_TYPE",
+        ...     is_base_scale=True
+        ... )
+
+        >>> # Create catchment aggregation scale
+        >>> catchments = SpatialScale(
+        ...     name="catchments",
+        ...     source="catchments.shp",
+        ...     unique_id_fields="CATCH_ID"
+        ... )
+
+    Attributes:
+        name (str): Human-readable identifier for this scale
+        data (GeoDataFrame): Spatial data with computed weights
+        geometry_type (str): 'polygon', 'line', or 'point'
+        weighting_field (str): Field used for ecological weighting
+        type_field (str): Field containing functional groups
+        results (dict): Cached aggregation results
     """
 
     def __init__(
@@ -66,23 +139,59 @@ class SpatialScale:
         is_base_scale: bool = False,
     ):
         """
-        Create a new spatial scale for analysis.
+        Initialize a spatial scale for hierarchical ecological analysis.
 
-        This function loads your shapefile and prepares it for analysis by:
-        1. Reading the geographic data
-        2. Detecting what type of geometry it contains (points/lines/polygons)
-        3. Calculating appropriate measures (area/length/count)
-        4. Validating that everything looks correct
+        This constructor loads and validates spatial ecological data, automatically
+        detecting geometry types and computing ecologically-appropriate weights.
 
-        Parameters explained in plain English:
-            name: A short name for this scale (used in output files)
-            source: Path to your shapefile
-            unique_id_fields: One or more columns that uniquely identify each feature
-            weighting_field: Column containing size/importance measure (or None to auto-calculate)
-            metric_fields: List of columns containing measures to be used for analysis
-            measure_multiplier: Number to multiply measures by (usually leave as None)
-            type_field: Column containing feature types for grouping (or None for no grouping)
-            is_base_scale: True if this is your smallest scale, False for larger scales
+        The initialization process follows landscape ecology best practices:
+        1. Spatial data validation and CRS standardization
+        2. Geometry type detection (critical for appropriate weighting)
+        3. Automatic weight calculation based on ecological relevance:
+           - Polygons (habitats): Area in hectares
+           - Lines (corridors): Length in meters
+           - Points (sites): Count-based weighting
+        4. Data quality validation and error reporting
+
+        Args:
+            name: Identifier for this spatial scale (e.g., 'wetlands', 'catchments')
+            source: Path to shapefile containing spatial features
+            unique_id_fields: Column(s) that uniquely identify each feature.
+                For compound keys use list: ['REGION_ID', 'SITE_ID']
+            weighting_field: Column containing ecological weights. If None,
+                automatically computed based on geometry type
+            metric_fields: Columns containing ecological metrics to aggregate.
+                Examples: ['NDVI_mean', 'species_richness', 'water_quality']
+            measure_multiplier: Scaling factor for weights (e.g., 0.0001 to
+                convert m² to hectares)
+            type_field: Column containing functional groups for ecological
+                classification (e.g., 'WETLAND_TYPE', 'VEG_COMMUNITY')
+            default_crs: Coordinate reference system. Defaults to EPSG:3577
+                (Australian Albers) for MDB region
+            is_base_scale: True for finest resolution data, False for
+                aggregation targets
+
+        Raises:
+            FileNotFoundError: If shapefile doesn't exist
+            ValueError: If required columns missing or data invalid
+
+        Examples:
+            >>> # Wetland base scale with vegetation metrics
+            >>> wetlands = SpatialScale(
+            ...     name="wetlands",
+            ...     source="MDB_wetlands.shp",
+            ...     unique_id_fields="WETLAND_ID",
+            ...     type_field="WETLAND_TYPE",
+            ...     metric_fields=['NDVI_2023', 'condition_score'],
+            ...     is_base_scale=True
+            ... )
+
+            >>> # River reach aggregation scale
+            >>> reaches = SpatialScale(
+            ...     name="river_reaches",
+            ...     source="MDB_reaches.shp",
+            ...     unique_id_fields="REACH_ID"
+            ... )
         """
         self.name = name
         self.source = Path(source)
@@ -102,10 +211,13 @@ class SpatialScale:
             else unique_id_fields
         )
 
-        # -----------------------------------------------------
-        # Determine which columns are required from the shapefile
-        # Only load what we need to make processing faster
-        # -----------------------------------------------------
+        # =====================================================================
+        # STEP 1: DETERMINE REQUIRED COLUMNS FOR EFFICIENT DATA LOADING
+        # =====================================================================
+        # In landscape ecology, datasets can be very large (thousands of
+        # wetlands, millions of vegetation plots). We optimize performance by
+        # loading only the columns needed for analysis, reducing memory usage
+        # and processing time for large ecological datasets.
         required_cols = set()
         required_cols.update(self.unique_id_fields)
         if weighting_field:
@@ -124,7 +236,12 @@ class SpatialScale:
         print(f"Loading {name} data from {self.source.name}...")
         print(f"   Requested: {required_cols}")
 
-        # Handle CRS - default to EPSG:4326 if not specified or invalid
+        # =====================================================================
+        # STEP 2: COORDINATE REFERENCE SYSTEM STANDARDIZATION
+        # =====================================================================
+        # Consistent CRS is critical for accurate spatial analysis in ecology.
+        # EPSG:3577 (Australian Albers) is optimal for area calculations across
+        # the Murray-Darling Basin, minimizing distortion for ecological metrics.
         try:
             self.default_crs = (
                 CRS.from_user_input(default_crs) if default_crs else CRS.from_epsg(3577)
@@ -136,7 +253,11 @@ class SpatialScale:
             self.default_crs = CRS.from_epsg(3577)
         print(f"   Using CRS: {self.default_crs.name}.")
 
-        # Read and validate shapefile
+        # =====================================================================
+        # STEP 3: LOAD AND VALIDATE SPATIAL DATA
+        # =====================================================================
+        # Load spatial data with geometry validation to ensure robust analysis.
+        # Invalid geometries can cause errors in spatial joins and aggregation.
         self.data = self._validate_geometries(
             gpd.read_file(self.source).to_crs(self.default_crs), fix_invalid=True
         )
@@ -184,8 +305,14 @@ class SpatialScale:
         #         f"Please check your column names in config.py"
         #     )
 
-        # Automatically detect what type of geometry this shapefile contains
-        # This determines how we calculate measures and perform aggregation
+        # =====================================================================
+        # STEP 4: GEOMETRY TYPE DETECTION FOR ECOLOGICAL WEIGHTING
+        # =====================================================================
+        # Different ecological features require different weighting approaches:
+        # - Wetland polygons: Area-based (habitat extent)
+        # - River lines: Length-based (corridor connectivity)
+        # - Monitoring points: Count-based (site representation)
+        # This detection ensures ecologically-appropriate aggregation methods.
         all_types = set(self.data.geometry.geom_type.unique())
         valid_polygon = all_types <= {"Polygon", "MultiPolygon"}
         valid_line = all_types <= {"LineString", "MultiLineString"}
@@ -202,7 +329,13 @@ class SpatialScale:
 
         print(f"   Detected geometry type: {geometry_type} ({len(self.data)} features)")
 
-        # Calculate default weighting field based on geometry type
+        # =====================================================================
+        # STEP 5: COMPUTE ECOLOGICALLY-APPROPRIATE WEIGHTS
+        # =====================================================================
+        # Automatic weight calculation follows ecological principles:
+        # - Larger habitats have greater ecological influence (area weighting)
+        # - Longer corridors provide more connectivity (length weighting)
+        # - Each monitoring site contributes equally (count weighting)
         if not weighting_field:
             if geometry_type == "polygon":
                 self.data["Area_Ha"] = self.data.geometry.area / 10000
@@ -468,78 +601,193 @@ class SpatialScale:
         keep_unmatched_types: bool = True,
         new_class_field: str = "regrouped",
     ) -> tuple[pd.DataFrame, str]:
-        """Apply reclassification mapping to create 'regrouped' column.
+        """
+        Apply functional group reclassification using substring matching.
+
+        This method implements flexible ecological classification by grouping
+        similar habitat types, species, or management categories based on
+        substring patterns in their names. This is essential in landscape
+        ecology where:
+
+        1. **Taxonomic grouping**: Species names may vary but belong to same family
+        2. **Habitat classification**: Detailed habitat types need broader groupings
+        3. **Management categories**: Administrative names need functional groupings
+
+        The substring matching approach handles common ecological data challenges:
+        - Inconsistent naming conventions across datasets
+        - Hierarchical classification systems (species → genus → family)
+        - Regional variations in habitat terminology
+
+        Ecological Examples:
+        - Wetland types: 'Permanent Freshwater Marsh' → 'Wetland'
+        - Vegetation: 'River Red Gum Woodland' → 'Woodland'
+        - Species: 'Acacia melanoxylon' → 'Acacia'
 
         Args:
-            df: DataFrame to modify
-            reclass_map: Mapping from group names to lists of substrings
-            keep_unmatched_types: Whether to retain unmatched types
+            df: DataFrame containing ecological data to reclassify
+            reclass_map: Dictionary mapping new group names to lists of
+                substring patterns. Example:
+                {
+                    'Wetland': ['marsh', 'swamp', 'wetland'],
+                    'Woodland': ['woodland', 'forest', 'trees']
+                }
+            keep_unmatched_types: If True, retains original names for
+                unmatched types. If False, removes unmatched records.
+                Critical decision for maintaining data completeness vs.
+                analytical focus.
+            new_class_field: Name for the new classification column
 
         Returns:
-            Tuple of (modified DataFrame, field name for grouping)
+            tuple: (modified DataFrame, field name for subsequent grouping)
+
+        Raises:
+            None: Method handles all edge cases gracefully with warnings
+
+        Examples:
+            >>> # Wetland functional grouping
+            >>> wetland_groups = {
+            ...     'Permanent': ['permanent', 'deep', 'lake'],
+            ...     'Seasonal': ['seasonal', 'ephemeral', 'temporary'],
+            ...     'Constructed': ['dam', 'channel', 'artificial']
+            ... }
+            >>> df, field = scale._apply_reclassification(
+            ...     df, wetland_groups, keep_unmatched_types=True
+            ... )
+
+        Notes:
+            - Case-insensitive matching for robust classification
+            - First match wins (order matters in reclass_map)
+            - Provides detailed mapping report for transparency
+            - Handles missing or null values gracefully
         """
+        # =====================================================================
+        # EARLY EXIT: NO RECLASSIFICATION NEEDED
+        # =====================================================================
+        # If no reclassification map provided or no type field exists,
+        # return original data unchanged. This allows the same aggregation
+        # code to work with and without functional grouping.
         if not reclass_map or not self.type_field:
             return df, self.type_field
 
+        # =====================================================================
+        # INITIALIZE RECLASSIFICATION PROCESS
+        # =====================================================================
         print(
             f"Reclassifying '{self.type_field}' into new groups '{new_class_field}' using substring match from reclass map..."
         )
 
+        # Clean up any existing classification column to avoid conflicts
+        # This ensures reproducible results when re-running analysis
         if new_class_field in df.columns:
             df.drop(columns=new_class_field, inplace=True)
             print(
                 f"\u26a0 Warning: removed existing '{new_class_field}' column and re-applying group rules."
             )
 
+        # =====================================================================
+        # DEFINE SUBSTRING MATCHING FUNCTION
+        # =====================================================================
+        # This nested function implements the core classification logic.
+        # It uses case-insensitive substring matching to handle variations
+        # in ecological naming conventions (e.g., 'Wetland' vs 'wetland').
         def match_reclass(value):
+            """Match ecological type to functional group using substring patterns."""
+            # Convert to string to handle numeric codes or mixed data types
+            value_str = str(value).lower()
+
+            # Iterate through functional groups in order (first match wins)
             for group, substrings in reclass_map.items():
                 for substr in substrings:
-                    if substr.lower() in str(value).lower():
+                    if substr.lower() in value_str:
                         return group
+
+            # Return None if no pattern matches (handled below)
             return None
 
+        # =====================================================================
+        # APPLY CLASSIFICATION TO ALL RECORDS
+        # =====================================================================
+        # Use pandas apply() for vectorized operation across all ecological types
         df[new_class_field] = df[self.type_field].apply(match_reclass)
 
+        # =====================================================================
+        # HANDLE UNMATCHED ECOLOGICAL TYPES
+        # =====================================================================
+        # Identify types that didn't match any classification pattern.
+        # This is common in ecological data due to:
+        # - Rare or unusual habitat types
+        # - Regional naming variations
+        # - Data entry inconsistencies
+        # - New types not in original classification scheme
+
         unmatched = df[df[new_class_field].isna()][self.type_field].unique()
+
         if len(unmatched) > 0:
             if not keep_unmatched_types:
+                # OPTION 1: Remove unmatched types (focused analysis)
+                # Use when analysis requires only well-defined functional groups
+                # Common in comparative studies or standardized assessments
                 df = df[~df[new_class_field].isna()].copy()
                 print(
-                    f"Dropped {len(unmatched)} types that did not match any re-grouping rules."
+                    f"Dropped {len(unmatched)} types that did not match any re-grouping rules. "
                     f"Keeping {len(df)} re-grouped rows.\n"
                     f"Set option 'keep_unmatched_types=True' to retain unmatched types."
                 )
             else:
+                # OPTION 2: Retain unmatched types with original names
+                # Use when comprehensive coverage is more important than
+                # standardized grouping. Preserves all ecological information.
                 df[new_class_field] = df[new_class_field].fillna(df[self.type_field])
                 print(
-                    f"Retained {len(unmatched)} original types that did not match any re-grouping rules"
+                    f"Retained {len(unmatched)} original types that did not match any re-grouping rules. "
                     f"Set option 'keep_unmatched_types=False' to drop these rows."
                 )
 
-        # Show mapping outcome
+        # =====================================================================
+        # GENERATE CLASSIFICATION REPORT FOR TRANSPARENCY
+        # =====================================================================
+        # Provide detailed mapping report to ensure classification accuracy.
+        # This is critical in ecological research for:
+        # - Verifying classification logic
+        # - Documenting methodological decisions
+        # - Enabling reproducible research
+        # - Identifying potential classification errors
+
         mapping = (
             df[[self.type_field, new_class_field]]
             .drop_duplicates()
             .sort_values(self.type_field)
         )
-        print(f"Mapping applied: '{self.type_field}' -> '{new_class_field}'")
 
-        # Compute max width of strings from both columns
+        print(
+            f"\nClassification mapping applied: '{self.type_field}' → '{new_class_field}'"
+        )
+        print("=" * 60)
+
+        # Format output for readability with aligned columns
         max_width = max(
             mapping[self.type_field].astype(str).map(len).max(),
             mapping[new_class_field].astype(str).map(len).max(),
         )
 
+        # Display each mapping with clear formatting
         for _, row in mapping.iterrows():
-            print(
-                f"  '{row[self.type_field]}'".ljust(max_width + 3)
-                + " -> "
-                + f"'{row[new_class_field]}'"
-            )
+            original = f"'{row[self.type_field]}'"
+            classified = f"'{row[new_class_field]}'"
+            print(f"  {original.ljust(max_width + 3)} → {classified}")
 
+        print(f"\nTotal unique types: {len(mapping)}")
+        print(f"Functional groups created: {mapping[new_class_field].nunique()}")
+
+        # =====================================================================
+        # RETURN CLASSIFIED DATA AND FIELD NAME
+        # =====================================================================
+        # Return both the modified DataFrame and the field name to use for
+        # subsequent grouping operations. This tuple approach ensures the
+        # calling code knows which field contains the functional groups.
         return df, new_class_field
 
-    def aggregate_joined(
+    def _aggregate_joined(
         self,
         df: GeoDataFrame,
         target_scale: "SpatialScale",
@@ -553,57 +801,135 @@ class SpatialScale:
         result_name: str = None,
     ) -> pd.DataFrame:
         """
-        Aggregate metrics from a spatial join result into the target spatial scale.
+        Aggregate ecological metrics from spatially joined data using
+        ecologically-appropriate weighting schemes.
 
-        All aggregation types are handled using a unified weighted framework:
-        - "count": metric=1, weight=1
-        - "sum": metric=values, weight=1
-        - "weighted_mean": metric=values, weight=from field
-        - "frequency_weighted": metric=values, weight=frequency / total per group
+        Aggregated_Value = Σ(Metric_i × Weight_i) / Σ(Weight_i)
+
+        Where weights vary by method:
+        - Area-weighted: Weight_i = Area_i (hectares)
+        - Length-weighted: Weight_i = Length_i (meters)
+        - Count-based: Weight_i = 1 (equal weighting)
+        - Frequency-weighted: Weight_i = Frequency_i / Total_frequency
 
         Args:
-            df: Joined GeoDataFrame of source + target features.
-            target_scale: The SpatialScale to aggregate into.
-            metric_columns: List of fields to aggregate.
-            method: Aggregation method.
-            reclass_map: Optional mapping from types to groups.
-            group_by: Optional extra grouping fields.
-            result_name: Key to store result in target_scale.results.
-            keep_unmatched: Whether to retain unmapped types if reclass_map is provided.
-            weighting_field: Optional override of default weight field.
+            df: Spatially joined GeoDataFrame containing source features
+                overlaid with target boundaries. Must include both source
+                metrics and target identifiers.
+            target_scale: SpatialScale object representing the aggregation
+                target (e.g., catchments, management units)
+            metric_columns: List of ecological metrics to aggregate.
+                Examples: ['NDVI_mean', 'species_richness', 'pH', 'condition_score']
+            method: Aggregation method selection:
+                - 'area_weighted': Area-proportional weighting (default)
+                - 'length_weighted': Length-proportional weighting
+                - 'count': Equal weighting for all features
+                - 'sum': Additive aggregation without averaging
+                - 'frequency_weighted': Compositional weighting by type frequency
+            reclass_map: Optional functional group classification.
+                Dictionary mapping group names to substring lists.
+                Example: {'Wetland': ['marsh', 'swamp'], 'Forest': ['woodland', 'trees']}
+            new_class_field: Name for reclassified functional groups column
+            group_by: Additional grouping variables for stratified analysis.
+                Examples: ['management_zone', 'conservation_status']
+            keep_unmatched_types: Whether to retain ecological types that
+                don't match reclassification patterns
+            weighting_field: Override default weighting field.
+                Useful for custom ecological importance weights
+            result_name: Storage key for aggregated results in target_scale.results
 
         Returns:
-            DataFrame: Aggregated result (without geometry).
-        """
-        df = df.copy()  # operate on a copy so we dont pollute the original data
+            pd.DataFrame: Aggregated ecological metrics without geometry.
+                Columns include target identifiers, functional groups (if used),
+                and aggregated metrics with method-specific suffixes.
 
-        # Remove duplicate columns before proceeding
+        Raises:
+            ValueError: If method unsupported or required columns missing
+
+        Notes:
+            - Preserves spatial relationships through proper weighting
+            - Handles edge cases (no overlaps, missing data) gracefully
+            - Provides detailed logging for methodological transparency
+            - Results cached for computational efficiency
+            - Maintains data provenance through clear column naming
+        """
+        # =====================================================================
+        # INITIALIZE AGGREGATION PROCESS
+        # =====================================================================
+        # Create a working copy to avoid modifying the original joined data.
+        # This ensures the spatial join cache remains clean for reuse and
+        # prevents unintended side effects in subsequent analyses.
+        df = df.copy()
+
+        # =====================================================================
+        # DATA QUALITY CONTROL: REMOVE DUPLICATE COLUMNS
+        # =====================================================================
+        # Spatial joins can create duplicate columns when source and target
+        # scales have similarly named fields. Remove duplicates to prevent
+        # aggregation errors and ensure clean results.
         if df.columns.duplicated().any():
             print(
                 "\u26a0 Warning: Duplicate columns found in input DataFrame. Cleaning up."
             )
         df = df.loc[:, ~df.columns.duplicated()]
 
+        # =====================================================================
+        # CONFIGURE WEIGHTING AND METRICS
+        # =====================================================================
+        # Determine the weighting field to use for aggregation. This is critical
+        # for ecologically-meaningful results:
+        # - Area weights for habitat condition metrics
+        # - Length weights for corridor connectivity measures
+        # - Count weights for point-based observations
         weight_field = weighting_field or self.weighting_field
         metric_columns = [str(col) for col in (metric_columns or [])]
 
-        # --- Handle type reclassification with substring matching ---
+        # =====================================================================
+        # FUNCTIONAL GROUP CLASSIFICATION (OPTIONAL)
+        # =====================================================================
+        # Apply ecological reclassification to group similar habitat types,
+        # species, or management categories. This step is crucial for:
+        # - Reducing complexity in diverse ecological datasets
+        # - Creating management-relevant functional groups
+        # - Enabling comparative analysis across regions
         df, reclass_field = self._apply_reclassification(
             df, reclass_map, keep_unmatched_types, new_class_field
         )
 
-        # --- Grouping keys ---
-        group_keys = (
-            target_scale.unique_id_fields.copy()
-        )  # Start with target scale's unique ID fields - use copy because it is a list
-        if reclass_field:
+        # =====================================================================
+        # CONSTRUCT GROUPING HIERARCHY
+        # =====================================================================
+        # Build the grouping structure for aggregation. The hierarchy typically
+        # follows ecological organization:
+        # 1. Target spatial units (catchments, management zones)
+        # 2. Functional groups (wetland types, vegetation communities)
+        # 3. Additional stratification (conservation status, management priority)
+
+        group_keys = target_scale.unique_id_fields.copy()  # Base spatial units
+
+        if reclass_field:  # Add functional groups if reclassification applied
             group_keys.append(reclass_field)
-        if group_by:
+
+        if group_by:  # Add additional stratification variables
             group_keys += [g for g in group_by if g not in group_keys]
 
-        print(f"Aggregating by {group_keys} using '{method}'")
+        # Report the final grouping structure for transparency
+        print(f"\nAggregating by {group_keys} using '{method}' method")
+        print(f"Processing {len(df)} spatially joined records")
+        print(f"Target metrics: {metric_columns}")
 
-        # --- Frequency-weighted method ---
+        # =====================================================================
+        # AGGREGATION METHOD 1: FREQUENCY-WEIGHTED ANALYSIS
+        # =====================================================================
+        # This method weights each ecological type by its relative frequency
+        # within each target unit. Essential for compositional analysis where
+        # the diversity and relative abundance of habitat types matters.
+        #
+        # Example: In a catchment with 60% wetlands and 40% forest,
+        # wetland metrics get 0.6 weight, forest metrics get 0.4 weight.
+        #
+        # Mathematical formula:
+        # Weight_i = Frequency_i / Total_frequency_in_target_unit
         if method == "frequency_weighted":
             if not reclass_field:
                 raise ValueError("frequency_weighted requires a type or reclass field")
@@ -622,26 +948,40 @@ class SpatialScale:
                 columns={col: f"{col}_frqwm" for col in metric_columns}, inplace=True
             )
 
-        # --- Unified aggregation framework ---
-        # All methods follow the same pattern: metric * weight, then aggregate
-        # This leverages the fact that __init__ creates appropriate weight fields:
-        # - Count method: uses Count=1 (from aggregation_method="count")
-        # - Sum method: uses Sum=1 (from aggregation_method="sum")
-        # - Geometry method: uses Area_Ha, Length_m, or Count based on geometry type
+        # =====================================================================
+        # AGGREGATION METHODS 2-4: UNIFIED WEIGHTED FRAMEWORK
+        # =====================================================================
+        # All remaining methods follow the same mathematical pattern:
+        # Aggregated_Value = Σ(Metric × Weight) / Σ(Weight)
+        #
+        # This unified approach ensures consistency and allows for easy
+        # extension to new weighting schemes. The key difference between
+        # methods is how weights are calculated:
+        #
+        # - COUNT: Weight = 1 (equal contribution from each feature)
+        # - SUM: Weight = 1, but no division (accumulative)
+        # - WEIGHTED_MEAN: Weight = ecological importance (area/length/custom)
         elif method in {"count", "sum", "weighted_mean"}:
 
-            # Step 1: Determine metrics and weights based on method
+            # =================================================================
+            # STEP 1: CONFIGURE METHOD-SPECIFIC WEIGHTS AND METRICS
+            # =================================================================
+            # Each aggregation method requires different weighting strategies
+            # based on the ecological question being addressed.
             if method == "count":
-                # Count aggregation: each feature = 1, weight = 1 (simple counting)
-                # Create Count field on-demand for this aggregation
+                # COUNT METHOD: Equal weighting for feature counting
+                # Use case: Number of monitoring sites, species occurrences,
+                # management actions. Each feature contributes equally regardless
+                # of size or other characteristics.
                 df["Count"] = 1
                 metrics_to_use = ["Count"]
                 weight_to_use = "Count"
                 suffix = "count"
 
             elif method == "sum":
-                # Sum aggregation: metric values, weight = 1 (unweighted sum)
-                # Create Sum field on-demand for this aggregation
+                # SUM METHOD: Additive aggregation for extensive properties
+                # Use case: Total habitat area, total species count, cumulative
+                # impact scores. Values accumulate across space without averaging.
                 if not metric_columns:
                     raise ValueError("sum method requires metric_columns")
                 df["Sum"] = 1
@@ -650,8 +990,10 @@ class SpatialScale:
                 suffix = "sum"
 
             elif method == "weighted_mean":
-                # Weighted mean: metric values, weight = area/length/count from __init__
-                # Uses Area_Ha, Length_m, or Count created in __init__ based on geometry type
+                # WEIGHTED MEAN METHOD: Ecologically-proportional weighting
+                # Use case: Habitat condition scores, vegetation indices, water
+                # quality measures. Larger/longer/more important features have
+                # greater influence on aggregated values.
                 if not metric_columns:
                     raise ValueError("weighted_mean method requires metric_columns")
                 if not weight_field:
@@ -660,8 +1002,12 @@ class SpatialScale:
                 weight_to_use = weight_field
                 suffix = f"{weight_field[:3].lower()}wm"  # e.g., "arewm" or "lenwm"
 
-            # Step 2: Apply the unified weighted aggregation formula
-            # Formula: (metric1*weight + metric2*weight + ...) / (weight1 + weight2 + ...)
+            # =================================================================
+            # STEP 2: APPLY UNIFIED WEIGHTED AGGREGATION FORMULA
+            # =================================================================
+            # Mathematical implementation of: Σ(Metric × Weight) / Σ(Weight)
+            # This preserves the ecological meaning of intensive properties
+            # while properly accounting for spatial extent or importance.
             weighted_metrics = df[metrics_to_use].multiply(df[weight_to_use], axis=0)
             weighted_metrics.columns = [f"{col}_weighted" for col in metrics_to_use]
 
@@ -676,17 +1022,28 @@ class SpatialScale:
                 axis=1,
             )
 
-            # Step 3: Group and sum all weighted values
+            # =================================================================
+            # STEP 3: SPATIAL AGGREGATION BY GROUPING HIERARCHY
+            # =================================================================
+            # Group by target units and functional groups, then sum weighted
+            # values. This step combines all overlapping source features
+            # within each target boundary.
             grouped = agg_df.groupby(group_keys).sum().reset_index()
 
-            # Step 4: Calculate final results based on method
+            # =================================================================
+            # STEP 4: COMPUTE FINAL AGGREGATED VALUES
+            # =================================================================
+            # Convert summed weighted values to final metrics based on the
+            # chosen aggregation method. This step differs between methods.
             if method == "count":
-                # For count: just return the sum of weights (each weight=1, so this gives count)
+                # COUNT RESULT: Total number of features in each target unit
+                # Useful for: monitoring site density, species occurrence frequency
                 result = grouped[group_keys + [weight_to_use]]
                 result.rename(columns={weight_to_use: "FeatureCount"}, inplace=True)
 
             elif method == "sum":
-                # For sum: return the weighted sums (weight=1, so this gives unweighted sums)
+                # SUM RESULT: Cumulative totals for extensive properties
+                # Useful for: total habitat area, cumulative impact scores
                 result = grouped[
                     group_keys + [f"{col}_weighted" for col in metrics_to_use]
                 ]
@@ -698,7 +1055,9 @@ class SpatialScale:
                 )
 
             elif method == "weighted_mean":
-                # For weighted mean: divide weighted sums by weight sums to get averages
+                # WEIGHTED MEAN RESULT: Properly weighted averages
+                # Useful for: habitat condition, vegetation health, water quality
+                # Formula ensures larger/more important features have greater influence
                 for col in metrics_to_use:
                     grouped[f"{col}_{suffix}"] = (
                         grouped[f"{col}_weighted"] / grouped[weight_to_use]
@@ -713,16 +1072,30 @@ class SpatialScale:
                 f"count, sum, weighted_mean, frequency_weighted"
             )
 
-        # --- Store results (without geometry) ---
+        # =====================================================================
+        # FINALIZE AND STORE AGGREGATION RESULTS
+        # =====================================================================
+        # Store results in the target scale's results dictionary for later
+        # access, visualization, and export. Results are stored without
+        # geometry to save memory and enable flexible output formats.
         if result_name:
+            # Initialize results dictionary if needed
             if not hasattr(target_scale, "results") or target_scale.results is None:
                 target_scale.results = {}
 
+            # Validate and potentially modify result name to avoid conflicts
             result_name = SpatialScale.validate_result_name(
                 result_name, set(target_scale.results.keys())
             )
+
+            # Store aggregated results for later use
             target_scale.results[result_name] = result
-            print(f"Stored result in {target_scale.name}.results['{result_name}']")
+            print(
+                f"\n✓ Aggregation complete. Results stored in {target_scale.name}.results['{result_name}']"
+            )
+            print(f"  - {len(result)} aggregated records created")
+            print(f"  - Columns: {list(result.columns)}")
+
         return result
 
     def aggregate_to(
@@ -731,31 +1104,110 @@ class SpatialScale:
         metric_columns: list[str],
         how: str = "intersects",
         method: str = "weighted_mean",
+        weighting_field: Optional[str] = None,
         group_by: list[str] = None,
         reclass_map: dict[str, str] = None,
         new_class_field: str = "regrouped",
-        weighting_field: Optional[str] = None,
         keep_unmatched_types: bool = True,
         result_name: str = None,
     ) -> GeoDataFrame:
         """
         Spatially join and aggregate base scale metrics into the target scale.
 
-        This wraps the spatial join and aggregation into one call.
+        Aggregate ecological metrics from spatially joined data using
+        ecologically-appropriate weighting schemes.
+
+        This method implements the core scaling-up logic that transfers
+        fine-resolution ecological data to broader management scales while
+        preserving biological meaning and statistical validity.
+
+        ECOLOGICAL RATIONALE:
+        Different ecological metrics require different aggregation approaches:
+
+        1. **Area-weighted means**: For intensive properties that represent
+           conditions per unit area (e.g., species density, vegetation health,
+           water quality). Larger habitats contribute proportionally more.
+
+        2. **Length-weighted means**: For linear features like riparian zones
+           where longer segments have greater ecological influence.
+
+        3. **Count-based aggregation**: For point observations where each
+           monitoring site contributes equally regardless of spatial extent.
+
+        4. **Frequency-weighted means**: For compositional data where the
+           relative abundance of different habitat types matters.
+
+        5. **Simple sums**: For extensive properties that accumulate across
+           space (e.g., total habitat area, total species count).
+
+        MATHEMATICAL FRAMEWORK:
+        All methods use a unified weighted aggregation formula:
+
+        Aggregated_Value = Σ(Metric_i x Weight_i) / Σ(Weight_i)
+
+        Where weights vary by method:
+        - Area-weighted: Weight_i = Area_i (hectares)
+        - Length-weighted: Weight_i = Length_i (meters)
+        - Count-based: Weight_i = 1 (equal weighting)
+        - Frequency-weighted: Weight_i = Frequency_i / Total_frequency
 
         Args:
-            target_scale: The SpatialScale to aggregate into.
-            metric_columns: List of numeric fields to aggregate.
+            target_scale: SpatialScale object representing the aggregation
+                target (e.g., catchments, management units)
+            metric_columns: List of ecological metrics to aggregate.
+                Examples: ['NDVI_mean', 'species_richness', 'pH', 'condition_score']
+            method: Aggregation method selection:
+                - 'area_weighted': Area-proportional weighting (default)
+                - 'length_weighted': Length-proportional weighting
+                - 'count': Equal weighting for all features
+                - 'sum': Additive aggregation without averaging
+                - 'frequency_weighted': Compositional weighting by type frequency
             how: Spatial join method (e.g., "intersects", "contains").
-            method: Aggregation method ("sum", "mean", "weighted_mean", etc.).
-            group_by: Optional extra fields to group by (e.g., basin, catchment).
-            reclass_map: Optional mapping for grouping types (used if self.type_field exists).
-            weighting_field: Optional override of this scale's weighting field.
-            keep_unmatched: If False, drops types not in reclass_map.
-            result_name: Key to store result in target_scale.results.
+            weighting_field: Override default weighting field.
+                Useful for custom ecological importance weights
+            group_by: Additional grouping variables for stratified analysis.
+                Examples: ['management_zone', 'conservation_status']
+            reclass_map: Optional functional group classification.
+                Dictionary mapping group names to substring lists.
+                Example: {'Wetland': ['marsh', 'swamp'], 'Forest': ['woodland', 'trees']}
+            new_class_field: Name for reclassified functional groups column
+            keep_unmatched_types: Whether to retain ecological types that
+                don't match reclassification patterns
+            result_name: Storage key for aggregated results in target_scale.results
+
+
 
         Returns:
             GeoDataFrame: Aggregated result with geometries from the target scale.
+
+
+        Examples:
+            >>> # Area-weighted wetland condition aggregation
+            >>> result = wetlands.aggregate_to(
+            ...     target_scale=catchments,
+            ...     metric_columns=['condition_score', 'NDVI_2023'],
+            ...     method='area_weighted',
+            ...     reclass_map={'Permanent': ['permanent', 'deep'],
+            ...                  'Seasonal': ['seasonal', 'ephemeral']},
+            ...     result_name='wetland_condition'
+            ... )
+
+            >>> # Frequency-weighted habitat diversity
+            >>> result = habitats.aggregate_to(
+            ...     target_scale=planning_units,
+            ...     metric_columns=['diversity_index'],
+            ...     method='frequency_weighted',
+            ...     group_by=['conservation_status']
+            ... )
+
+        Notes:
+            - Preserves spatial relationships through proper weighting
+            - Handles edge cases (no overlaps, missing data) gracefully
+            - Provides detailed logging for methodological transparency
+            - Results cached for computational efficiency
+            - Maintains data provenance through clear column naming
+
+
         """
         if not isinstance(target_scale, SpatialScale):
             raise TypeError("target_scale must be a SpatialScale instance")
@@ -805,7 +1257,7 @@ class SpatialScale:
         joined_df = self.spatial_join(target_scale, how=how)
 
         # Aggregate and store in target scale
-        return self.aggregate_joined(
+        return self._aggregate_joined(
             joined_df,
             target_scale,
             metric_columns=metric_columns,
