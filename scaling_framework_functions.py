@@ -19,8 +19,10 @@ import pandas as pd
 import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 import re
+import math
 from matplotlib.lines import Line2D
 from typing import List, Optional, Union
 from pathlib import Path
@@ -459,6 +461,84 @@ class SpatialScale:
 
         return self._join_cache[cache_key]
 
+    def _apply_reclassification(
+        self,
+        df: pd.DataFrame,
+        reclass_map: dict,
+        keep_unmatched_types: bool = True,
+        new_class_field: str = "regrouped",
+    ) -> tuple[pd.DataFrame, str]:
+        """Apply reclassification mapping to create 'regrouped' column.
+
+        Args:
+            df: DataFrame to modify
+            reclass_map: Mapping from group names to lists of substrings
+            keep_unmatched_types: Whether to retain unmatched types
+
+        Returns:
+            Tuple of (modified DataFrame, field name for grouping)
+        """
+        if not reclass_map or not self.type_field:
+            return df, self.type_field
+
+        print(
+            f"Reclassifying '{self.type_field}' into new groups '{new_class_field}' using substring match from reclass map..."
+        )
+
+        if new_class_field in df.columns:
+            df.drop(columns=new_class_field, inplace=True)
+            print(
+                f"\u26a0 Warning: removed existing '{new_class_field}' column and re-applying group rules."
+            )
+
+        def match_reclass(value):
+            for group, substrings in reclass_map.items():
+                for substr in substrings:
+                    if substr.lower() in str(value).lower():
+                        return group
+            return None
+
+        df[new_class_field] = df[self.type_field].apply(match_reclass)
+
+        unmatched = df[df[new_class_field].isna()][self.type_field].unique()
+        if len(unmatched) > 0:
+            if not keep_unmatched_types:
+                df = df[~df[new_class_field].isna()].copy()
+                print(
+                    f"Dropped {len(unmatched)} types that did not match any re-grouping rules."
+                    f"Keeping {len(df)} re-grouped rows.\n"
+                    f"Set option 'keep_unmatched_types=True' to retain unmatched types."
+                )
+            else:
+                df[new_class_field] = df[new_class_field].fillna(df[self.type_field])
+                print(
+                    f"Retained {len(unmatched)} original types that did not match any re-grouping rules"
+                    f"Set option 'keep_unmatched_types=False' to drop these rows."
+                )
+
+        # Show mapping outcome
+        mapping = (
+            df[[self.type_field, new_class_field]]
+            .drop_duplicates()
+            .sort_values(self.type_field)
+        )
+        print(f"Mapping applied: '{self.type_field}' -> '{new_class_field}'")
+
+        # Compute max width of strings from both columns
+        max_width = max(
+            mapping[self.type_field].astype(str).map(len).max(),
+            mapping[new_class_field].astype(str).map(len).max(),
+        )
+
+        for _, row in mapping.iterrows():
+            print(
+                f"  '{row[self.type_field]}'".ljust(max_width + 3)
+                + " -> "
+                + f"'{row[new_class_field]}'"
+            )
+
+        return df, new_class_field
+
     def aggregate_joined(
         self,
         df: GeoDataFrame,
@@ -466,10 +546,11 @@ class SpatialScale:
         metric_columns: list[str],
         method: str = "weighted_mean",
         reclass_map: dict[str, str] = None,
+        new_class_field: str = "regrouped",
         group_by: list[str] = None,
-        result_name: str = None,
         keep_unmatched_types: bool = True,
         weighting_field: Optional[str] = None,
+        result_name: str = None,
     ) -> pd.DataFrame:
         """
         Aggregate metrics from a spatial join result into the target spatial scale.
@@ -494,10 +575,7 @@ class SpatialScale:
         Returns:
             DataFrame: Aggregated result (without geometry).
         """
-        if "regrouped" in df.columns:
-            print("⚠️  'regrouped' column already exists before aggregation starts")
-
-        df = df.copy()
+        df = df.copy()  # operate on a copy so we dont pollute the original data
 
         # Remove duplicate columns before proceeding
         if df.columns.duplicated().any():
@@ -510,55 +588,10 @@ class SpatialScale:
         metric_columns = [str(col) for col in (metric_columns or [])]
 
         # --- Handle type reclassification with substring matching ---
-        reclass_field = None
-        if reclass_map and self.type_field:
-            print(
-                f"Reclassifying '{self.type_field}' into new groups 'regrouped' using substring match from reclass map..."
-            )
+        df, reclass_field = self._apply_reclassification(
+            df, reclass_map, keep_unmatched_types, new_class_field
+        )
 
-            # Remove old regrouped column if it exists
-            if "regrouped" in df.columns:
-                df.drop(columns="regrouped", inplace=True)
-                print(
-                    "\u26a0 Warning: removed existing 'regrouped' column and re-applying group rules."
-                )
-
-            def match_reclass(value):
-                for group, substrings in reclass_map.items():
-                    for substr in substrings:
-                        if (
-                            substr.lower() in str(value).lower()
-                        ):  # Case-insensitive match
-                            return group
-                return None
-
-            # Apply the reclassification mapping
-            # This creates a new column 'regrouped' with matched groups or NaN if no match
-            df["regrouped"] = df[self.type_field].apply(match_reclass)
-
-            # Handle unmatched types
-            unmatched = df[df["regrouped"].isna()][self.type_field].unique()
-            if len(unmatched) > 0:
-                if not keep_unmatched_types:
-                    df = df[~df["regrouped"].isna()].copy()
-                    print(
-                        f"Dropped {len(unmatched)} types that did not match any re-grouping rules."
-                        f"Keeping {len(df)} re-grouped rows.\n"
-                        f"Set option 'keep_unmatched_types=True' to retain unmatched types."
-                    )
-                else:
-                    # Fill in original type_field values for unmatched rows
-                    df["regrouped"] = df["regrouped"].fillna(df[self.type_field])
-                    print(
-                        f"Retained {len(unmatched)} original types that did not match any re-grouping rules"
-                        f"Set option 'keep_unmatched_types=False' to drop these rows."
-                    )
-
-            reclass_field = "regrouped"
-
-        elif self.type_field:
-            reclass_field = self.type_field
-        print(f"target_scale.unique_id_fields {target_scale.unique_id_fields}")
         # --- Grouping keys ---
         group_keys = (
             target_scale.unique_id_fields.copy()
@@ -625,7 +658,7 @@ class SpatialScale:
                     raise ValueError("weighted_mean requires a weighting_field")
                 metrics_to_use = metric_columns
                 weight_to_use = weight_field
-                suffix = f"{weight_field[:4]}wm"  # e.g., "Area_wm" or "Leng_wm"
+                suffix = f"{weight_field[:3].lower()}wm"  # e.g., "arewm" or "lenwm"
 
             # Step 2: Apply the unified weighted aggregation formula
             # Formula: (metric1*weight + metric2*weight + ...) / (weight1 + weight2 + ...)
@@ -681,27 +714,29 @@ class SpatialScale:
             )
 
         # --- Store results (without geometry) ---
-        if not hasattr(target_scale, "results") or target_scale.results is None:
-            target_scale.results = {}
+        if result_name:
+            if not hasattr(target_scale, "results") or target_scale.results is None:
+                target_scale.results = {}
 
-        result_name = SpatialScale.validate_result_name(
-            result_name, set(target_scale.results.keys())
-        )
-        target_scale.results[result_name] = result
-        print(f"Stored result in {target_scale.name}.results['{result_name}']")
+            result_name = SpatialScale.validate_result_name(
+                result_name, set(target_scale.results.keys())
+            )
+            target_scale.results[result_name] = result
+            print(f"Stored result in {target_scale.name}.results['{result_name}']")
         return result
 
     def aggregate_to(
         self,
         target_scale: "SpatialScale",
         metric_columns: list[str],
-        method: str = "weighted_mean",
-        reclass_map: dict[str, str] = None,
-        group_by: list[str] = None,
-        result_name: str = None,
-        keep_unmatched_types: bool = True,
         how: str = "intersects",
+        method: str = "weighted_mean",
+        group_by: list[str] = None,
+        reclass_map: dict[str, str] = None,
+        new_class_field: str = "regrouped",
         weighting_field: Optional[str] = None,
+        keep_unmatched_types: bool = True,
+        result_name: str = None,
     ) -> GeoDataFrame:
         """
         Spatially join and aggregate base scale metrics into the target scale.
@@ -711,13 +746,13 @@ class SpatialScale:
         Args:
             target_scale: The SpatialScale to aggregate into.
             metric_columns: List of numeric fields to aggregate.
-            method: Aggregation method ("sum", "mean", "weighted_mean", etc.).
-            reclass_map: Optional mapping for grouping types (used if self.type_field exists).
-            group_by: Optional extra fields to group by (e.g., basin, catchment).
-            result_name: Key to store result in target_scale.results.
-            keep_unmatched: If False, drops types not in reclass_map.
             how: Spatial join method (e.g., "intersects", "contains").
+            method: Aggregation method ("sum", "mean", "weighted_mean", etc.).
+            group_by: Optional extra fields to group by (e.g., basin, catchment).
+            reclass_map: Optional mapping for grouping types (used if self.type_field exists).
             weighting_field: Optional override of this scale's weighting field.
+            keep_unmatched: If False, drops types not in reclass_map.
+            result_name: Key to store result in target_scale.results.
 
         Returns:
             GeoDataFrame: Aggregated result with geometries from the target scale.
@@ -776,10 +811,11 @@ class SpatialScale:
             metric_columns=metric_columns,
             method=method,
             reclass_map=reclass_map,
+            new_class_field=new_class_field,
             group_by=group_by,
-            result_name=result_name,
             keep_unmatched_types=keep_unmatched_types,
             weighting_field=weighting_field,
+            result_name=result_name,
         )
 
     def save_results(
@@ -988,7 +1024,7 @@ class SpatialScale:
 
         Args:
             fields: List of columns to standardise (default: all numeric excluding protected).
-            suffix: Suffix to append to new standardised columns (e.g., "z" → "2020z").
+            suffix: Suffix to append to new standardised columns (e.g., "z" ? "2020z").
 
         Returns:
             DataFrame (or GeoDataFrame) with standardised fields.
@@ -1033,7 +1069,7 @@ class SpatialScale:
 
         Args:
             fields: List of columns to normalise (default: all numeric excluding protected).
-            suffix: Suffix for normalised output columns (e.g., "n" → "2020n").
+            suffix: Suffix for normalised output columns (e.g., "n" ? "2020n").
 
         Returns:
             DataFrame (or GeoDataFrame) with normalised fields.
@@ -1060,7 +1096,7 @@ class SpatialScale:
             min_val = self.data[col].min()
             max_val = self.data[col].max()
             if min_val == max_val:
-                print(f"\u26a0 Skipping {col} — no variation (min = max = {min_val})")
+                print(f"\u26a0 Skipping {col} no variation (min = max = {min_val})")
                 continue
             self.data[f"{col}{suffix}"] = (self.data[col] - min_val) / (
                 max_val - min_val
@@ -1073,7 +1109,11 @@ class SpatialScale:
         self,
         result: str = None,
         field: str = None,
-        color_range: Optional[List[float]] = None,
+        reclass_map: dict = None,
+        reclass_field: str = "regrouped",  # this is the default can be over-ridden when applying the reclass_map
+        vmin: float = None,
+        vmax: float = None,
+        title: str = None,
     ) -> None:
         """
         Plot the base scale spatial data.
@@ -1082,26 +1122,22 @@ class SpatialScale:
             base_scale: SpatialScale object containing the base data
             title: Optional title for the plot
         """
+
         print(f"Plotting {self.name}...")
         if result and result in self.results.keys():
             result_df = self.results[result].copy()
             geometry_df = self.data[self.unique_id_fields + ["geometry"]]
             df = geometry_df.merge(result_df, on=self.unique_id_fields, how="left")
-            # Clean column names (remove _target if possible)
-            rename_map = {
-                col: col.replace("_target", "")
-                for col in df.columns
-                if col.endswith("_target")
-                and col.replace("_target", "") not in df.columns
-            }
-            if rename_map:
-                df.rename(columns=rename_map, inplace=True)
-                print(df)
+
         else:
             print(
-                f"Result not found. Using {self.name} data. Saved results are {self.results.keys()}"
+                f"Result not found. Using {self.name} data. Saved results are {list(self.results.keys())}"
             )
             df = self.data
+            if reclass_map:
+                df, reclass_field = self._apply_reclassification(
+                    df, reclass_map, keep_unmatched_types=False
+                )
 
         if field is None or field not in df.columns:
             print(
@@ -1109,23 +1145,75 @@ class SpatialScale:
                 f"Available fields: {df.columns.tolist()}"
             )
             ax = self.data.plot(color="lightblue", edgecolor="blue")
+            ax.set_title(f"Base Scale: {self.name}")
+            ax.axis("off")
         else:
-            plot_kwargs = {
-                "column": field,
-                "cmap": "viridis",
-                "edgecolor": "black",
-                "legend": True,
-            }
+            # Color scale settings
+            vmin = vmin or df[field].min()
+            vmax = vmax or df[field].max()
+            cmap = plt.cm.viridis
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
-            if color_range and isinstance(color_range, list) and len(color_range) == 2:
-                plot_kwargs["vmin"] = color_range[0]
-                plot_kwargs["vmax"] = color_range[1]
-                print(f"Using fixed color range: {color_range}")
+            # Group info
+            if reclass_field in df.columns:
+                grp = df[reclass_field]
+            else:
+                grp = df[self.type_field]
+            groups = grp.unique()
+            n_groups = len(groups)
+            cols = 3
+            rows = math.ceil(n_groups / cols)
 
-            ax = df.plot(**plot_kwargs)
+            # Create subplots
+            fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows))
+            axes = axes.flatten()
 
-        ax.set_title(f"Base Scale: {self.name}")
-        ax.axis("off")
+            # Store axis and group info for title-setting step
+            plotted_axes = []
+
+            # Plot each group
+            for i, group in enumerate(groups):
+                ax = axes[i]
+
+                # Set axis to base extent
+                bounds = df.total_bounds
+                ax.set_xlim(bounds[0], bounds[2])
+                ax.set_ylim(bounds[1], bounds[3])
+
+                filtered_result = df[grp == group]
+                filtered_result.plot(
+                    column=field,
+                    cmap=cmap,
+                    norm=norm,
+                    ax=ax,
+                    edgecolor="blue",
+                    legend=False,
+                )
+                ax.set_title(f"{self.name} - {group}")
+                # ax.axis("off")
+                # keep the axes as a bounding box but hide the tickmarks and labels
+                ax.tick_params(
+                    axis="both",
+                    which="both",
+                    length=0,
+                    labelbottom=False,
+                    labelleft=False,
+                )
+                plotted_axes.append((ax, group))
+
+            # Turn off unused axes
+            for j in range(i + 1, len(axes)):
+                axes[j].axis("off")
+
+            # Shared vertical colorbar next to first row
+            first_row_axes = axes[0:cols]
+            bbox = first_row_axes[-1].get_position()
+            cbar_ax = fig.add_axes([bbox.x1 + 0.01, bbox.y0, 0.01, bbox.y1 - bbox.y0])
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm._A = []
+            cbar = fig.colorbar(sm, cax=cbar_ax)
+            cbar.set_label(field)
+
         plt.show()
 
 

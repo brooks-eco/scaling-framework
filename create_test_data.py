@@ -22,18 +22,18 @@ base_polygons = [
 ]
 
 base_data = {
-    'UID': ['B001', 'B002', 'B003', 'B004'],
-    'HabitatType': ['Forest', 'Wetland', 'Forest', 'Grassland'],
-    'Area_Ha': [200, 200, 200, 200],
-    'NDVI': [0.8, 0.6, 0.75, 0.5],
-    'geometry': base_polygons
+    "UID": ["B001", "B002", "B003", "B004"],
+    "SystemType": ["Forest", "Wetland", "Forest", "Grassland"],
+    "Area_Ha": [200, 200, 200, 200],
+    "NDVI": [0.8, 0.6, 0.75, 0.5],
+    "geometry": base_polygons,
 }
 
 # Ensure all data is properly formatted
 base_gdf = gpd.GeoDataFrame(base_data, crs=crs)
 # Force save all columns by explicitly setting dtypes
 base_gdf['UID'] = base_gdf['UID'].astype(str)
-base_gdf['HabitatType'] = base_gdf['HabitatType'].astype(str)
+base_gdf["SystemType"] = base_gdf["SystemType"].astype(str)
 base_gdf['Area_Ha'] = base_gdf['Area_Ha'].astype(float)
 base_gdf['NDVI'] = base_gdf['NDVI'].astype(float)
 
