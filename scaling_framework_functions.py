@@ -66,6 +66,7 @@ import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 import re
 import math
+import copy
 from matplotlib.lines import Line2D
 from typing import List, Optional, Union
 from pathlib import Path
@@ -1078,6 +1079,15 @@ class SpatialScale:
         # Store results in the target scale's results dictionary for later
         # access, visualization, and export. Results are stored without
         # geometry to save memory and enable flexible output formats.
+
+        result_obj = SpatialScale.Result(
+            f"{self.name}_{method}_{target_scale.name}",
+            target_scale,
+            self.name,
+            group_keys,
+            result,
+        )
+
         if result_name:
             # Initialize results dictionary if needed
             if not hasattr(target_scale, "results") or target_scale.results is None:
@@ -1088,15 +1098,25 @@ class SpatialScale:
                 result_name, set(target_scale.results.keys())
             )
 
+            result_obj.name = result_name
             # Store aggregated results for later use
-            target_scale.results[result_name] = result
-            print(
-                f"\n✓ Aggregation complete. Results stored in {target_scale.name}.results['{result_name}']"
-            )
-            print(f"  - {len(result)} aggregated records created")
-            print(f"  - Columns: {list(result.columns)}")
+            target_scale.results[result_name] = result_obj
+            # = SpatialScale.Result(
+            #     result_name,
+            #     target_scale,
+            #     self.name,
+            #     group_keys,
+            #     result,
+            # )
+            print(f"Stored aggregated results as '{result_name}'")
 
-        return result
+        # # create a copy of the stored result and add the geometry to return
+        # geometry_df = target_scale.data[target_scale.unique_id_fields + ["geometry"]]
+        # result_obj.data = geometry_df.merge(
+        #     result_obj.data, on=target_scale.unique_id_fields, how="left"
+        # )
+
+        return result_obj
 
     def aggregate_to(
         self,
@@ -1178,7 +1198,9 @@ class SpatialScale:
 
 
         Returns:
-            GeoDataFrame: Aggregated result with geometries from the target scale.
+            Result: Result object containing aggregated ecological data with
+                metadata about the scaling process. Access the GeoDataFrame
+                via result.data attribute.
 
 
         Examples:
@@ -1293,63 +1315,15 @@ class SpatialScale:
 
         if output_folder == "list":
             print("Available results:")
-            for result_name, result_df in self.results.items():
+            for result_name, result_obj in self.results.items():
+                # group_by = [f for f in group_keys if f not in self.unique_id_fields]
                 print(
-                    f"  {result_name.ljust(30)} - {str(len(result_df)).rjust(10)} rows {result_df.columns.tolist()}"
+                    f"  {result_name.ljust(30)} - scaled from: '{result_obj.from_scale_name}' to {result_obj.parent.name} with grouping: {result_obj.group_by} - {str(len(result_obj.data)).rjust(10)} rows {result_obj.data.columns.tolist()}"
                 )
             return
 
-        if output_folder is None:
-            print("No output path provided. Results not saved.")
-            return
-
-        # Normalize and prepare output folder
-        output_folder = Path.cwd() / Path(output_folder).name
-        output_folder.mkdir(parents=True, exist_ok=True)
-
-        # Normalize file types
-        file_types = [file_types] if isinstance(file_types, str) else file_types
-        file_types = [
-            f.lower() if f.startswith(".") else f".{f.lower()}" for f in file_types
-        ]
-        valid_types = {".csv", ".shp", ".gpkg"}
-
-        for ext in file_types:
-            if ext not in valid_types:
-                raise ValueError(
-                    f"Invalid file type: {ext}. Valid types: {', '.join(valid_types)}"
-                )
-
-        # Get base geometry for join (protecting unique_id_fields list )
-        geometry_df = self.data[self.unique_id_fields + ["geometry"]]
-
-        for result_name, result_df in self.results.items():
-            # Join geometry on demand
-            full_df = geometry_df.merge(result_df, on=self.unique_id_fields, how="left")
-
-            # Clean column names (remove _target if possible)
-            rename_map = {
-                col: col.replace("_target", "")
-                for col in full_df.columns
-                if col.endswith("_target")
-                and col.replace("_target", "") not in full_df.columns
-            }
-            if rename_map:
-                full_df.rename(columns=rename_map, inplace=True)
-
-            for ext in file_types:
-                save_path = output_folder / f"{self.name}_{result_name}{ext}"
-
-                if ext == ".csv":
-                    full_df.drop(columns="geometry", errors="ignore").to_csv(
-                        save_path, index=False
-                    )
-                elif ext == ".gpkg":
-                    full_df.to_file(save_path, layer=self.name, driver="GPKG")
-                elif ext == ".shp":
-                    full_df.to_file(save_path, driver="ESRI Shapefile")
-
-                print(f"Saved {ext.upper()}: {save_path}")
+        for result_name, result_obj in self.results.items():
+            result_obj.export(output_folder, file_types)
 
     def _validate_metric_data(
         self,
@@ -1576,26 +1550,36 @@ class SpatialScale:
         """
 
         print(f"Plotting {self.name}...")
-        if result and result in self.results.keys():
-            result_df = self.results[result].copy()
-            geometry_df = self.data[self.unique_id_fields + ["geometry"]]
-            df = geometry_df.merge(result_df, on=self.unique_id_fields, how="left")
-
-        else:
-            print(
-                f"Result not found. Using {self.name} data. Saved results are {list(self.results.keys())}"
-            )
-            df = self.data
-            if reclass_map:
-                df, reclass_field = self._apply_reclassification(
-                    df, reclass_map, keep_unmatched_types=False
+        if result:
+            # result = result.lower()
+            if result not in self.results.keys():
+                print(
+                    f"Result not found. Using {self.name} data. Saved results are {list(self.results.keys())}"
                 )
+                df = self.data
+            else:
+                print(f"Using save result: {result}")
+                result_obj = self.results[result]
+                # results are saved without geometry for efficiency.  So now re-attach the geometry
+                geometry_df = self.data[self.unique_id_fields + ["geometry"]]
+                df = geometry_df.merge(
+                    result_obj.data, on=self.unique_id_fields, how="left"
+                )
+            result_grouping = result_obj.group_by
+        else:
+            df = self.data
+
+        if reclass_map:
+            df, reclass_field = self._apply_reclassification(
+                df, reclass_map, keep_unmatched_types=False
+            )
 
         if field is None or field not in df.columns:
-            print(
-                f"{field} not found in the data or not provided. Plotting with default color."
-                f"Available fields: {df.columns.tolist()}"
-            )
+            if field is not None:
+                print(
+                    f"Field '{field}' not found in data. "
+                    f"Available fields: {df.columns.tolist()}"
+                )
             ax = self.data.plot(color="lightblue", edgecolor="blue")
             ax.set_title(f"Base Scale: {self.name}")
             ax.axis("off")
@@ -1607,10 +1591,24 @@ class SpatialScale:
             norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
             # Group info
-            if reclass_field in df.columns:
+            if reclass_field and reclass_field in df.columns:
                 grp = df[reclass_field]
-            else:
+            elif result_grouping:
+                # No grouping field available, create single group
+                # grp = pd.Series(['All'] * len(df), index=df.index)
+                type_field = [
+                    f for f in result_grouping if f not in self.unique_id_fields
+                ]
+                grp = df[type_field[0]]
+                print(f"grouped by: {type_field}")
+            elif self.type_field and self.type_field in df.columns:
                 grp = df[self.type_field]
+            else:
+                raise ValueError(
+                    f"Grouping field not found. Available fields: {df.columns.tolist()}"
+                )
+
+            # groups = grp.dropna().unique() if grp is not None else ["All"]
             groups = grp.unique()
             n_groups = len(groups)
             cols = 3
@@ -1667,6 +1665,116 @@ class SpatialScale:
             cbar.set_label(field)
 
         plt.show()
+
+    class Result:
+        """
+        Container for aggregated ecological data from spatial scaling operations.
+
+        This class encapsulates the results of hierarchical spatial aggregation,
+        providing metadata about the scaling process and source data. It serves
+        as the return object for SpatialScale.aggregate_to() operations.
+
+        The Result class maintains provenance information and resulting metrics.
+
+        Attributes:
+            name (str): Identifier for this aggregation result
+            parent: the SpatialScale object holding the result (the target scale)
+            from_scale_name (str): Name of the source spatial scale
+            group_by (List[str]): grouping variables used to stratify aggregation
+            data (pd.DataFrame): Aggregated ecological metrics without geometries
+
+        """
+
+        def __init__(
+            self,
+            name: str,
+            parent: "SpatialScale",
+            from_scale_name: str,
+            group_by: List[str],
+            data: pd.DataFrame,
+        ):
+
+            self.name = name
+            self.parent = parent
+            self.from_scale_name = from_scale_name
+            self.group_by = group_by
+            self.data = data
+
+        def __str__(self) -> str:
+            """
+            Generate human-readable summary of aggregation results.
+
+            Returns:
+                str: Formatted summary including metadata and data preview
+            """
+            return (
+                f"{'-'*5} Result: {self.name} {'-'*20}\n"
+                f"Scaled from: {self.from_scale_name}\n"
+                f"Scaled to: {self.parent.name}\n"
+                f"Grouped by: {self.group_by}\n"
+                f"Records: {len(self.data)}\n"
+                f"Columns: {list(self.data.columns)}\n"
+                f"Data preview:\n{self.data.head()}\n"
+            )
+
+        def summary_stats(self) -> pd.DataFrame:
+            """
+            Generate summary statistics for aggregated ecological metrics.
+
+            Returns:
+                pd.DataFrame: Statistical summary of numeric columns
+            """
+            numeric_cols = self.data.select_dtypes(include=[np.number]).columns
+            return self.data[numeric_cols].describe()
+
+        def export(
+            self, output_folder: Union[str, Path], file_format: str = "csv"
+        ) -> None:
+            """
+            Export aggregated results to file.
+
+            Args:
+                output_folder: Directory where files will be saved.
+                file_types: File types to save (e.g., ".csv", ".shp", ".gpkg").
+            """
+            if output_folder is None:
+                print("No output path provided. Results not saved.")
+                return
+
+            # Normalize and prepare output folder
+            output_folder = Path.cwd() / Path(output_folder)
+            output_folder.mkdir(parents=True, exist_ok=True)
+
+            # Normalize file types
+            file_format = [file_format] if isinstance(file_format, str) else file_format
+            file_format = [
+                f.lower() if f.startswith(".") else f".{f.lower()}" for f in file_format
+            ]
+
+            valid_types = {".csv", ".shp", ".gpkg"}
+            for ext in file_format:
+                if ext not in valid_types:
+                    raise ValueError(
+                        f"Invalid file format: {ext}. Valid types: {valid_types}"
+                    )
+                out_file = output_folder / f"{self.name}{ext}"
+                print(f"exporting {out_file}")
+                if ext == ".csv":
+                    # Export without geometry for CSV
+                    # data_no_geom = self.data.drop(columns="geometry", errors="ignore")
+                    self.data.to_csv(out_file, index=False)
+                if ext in [".gpkg", ".shp"]:
+
+                    geometry_df = self.parent.data[
+                        self.parent.unique_id_fields + ["geometry"]
+                    ]
+                    result_df = geometry_df.merge(
+                        self.data, on=self.parent.unique_id_fields, how="left"
+                    )
+                    if ext == f".gpkg":
+                        result_df.to_file(out_file, driver="GPKG")
+                    if ext == f".shp":
+                        result_df.to_file(out_file, driver="ESRI Shapefile")
 
 
 def plot_spatial_hierarchy(*args: SpatialScale) -> None:
