@@ -113,24 +113,6 @@ Runs a complete example using generated test data. It demonstrates:
 - calculating area and frequency weighted averages
 - Visualising the results
 
-`scaling_framework.ipynb` (WORK IN PROGRESS)
-
-Demonstrates scaling-up ANAE ecosystem polygons in the Murray–Darling Basin to larger units such as:
-
-- Ramsar sites
-- Directory of Important Wetlands (DIWA)
-- Valleys
-- Northern and Southern Basin regions.
-
-**Note:** Due to their size, source datasets are not included in this repository.
-
-### Referenced Datasets ###
-
-- Brooks S (2021) Australian National Aquatic Ecosystem (ANAE) Classification of the Murray-Darling Basin v3.0. Wetland Polygons. Accessed 16 May 2023, [Dataset](https://fed.dcceew.gov.au/datasets/1e57385ab8374f51b4b518a8cf571dbc/about)
-- DAWE (2020) Ramsar Wetlands of Australia. Accessed 26 February 2021, [Dataset](http://www.environment.gov.au/fed/catalog/search/resource/details.page?uuid=%7BF49BFC55-4306-4185-85A9-A5F8CD2380CF%7D)
-- MDBA (2018) Basin-Wide Environmental Watering Strategy Regions for Vegetation Outcomes. Accessed 29 June 2025, [Dataset](https://data.gov.au/data/dataset/basin-wide-environmental-watering-strategy-regions-for-vegetation-outcomes).
-- Directory of Important Wetlands (DIWA), polygon shapefile [DIWA Wetlands Database](https://www.dcceew.gov.au/water/wetlands/australian-wetlands-database)
-
 ## Requirements
 
 - python
@@ -148,10 +130,8 @@ pip install -r requirements.txt
 
 ## Author and Licence
 
-**Open Source** - Creative Commons v4 with attribution CCby4
+**Open Source** - Creative Commons v4 - go for it.
 
-**Citation:**  Brooks (2025). MDB Scaling-up Framework: Flow-MER Program. Commonwealth Environmental Water Holder, Australian Government Department of Climate Change, Energy, the Environment and Water. Sourced from [https://github.com/brooks-eco/scaling-framework](https://github.com/brooks-eco/scaling-framework)
-
-**Author:** Shane Brooks
+**Citation:**  Brooks S (2025). Scaling Framework: Flow-MER Program. Commonwealth Environmental Water Holder, Australian Government Department of Climate Change, Energy, the Environment and Water. Sourced from [https://github.com/brooks-eco/scaling-framework](https://github.com/brooks-eco/scaling-framework)
 
 ![Brooks Logo](brooks-logo.png)
