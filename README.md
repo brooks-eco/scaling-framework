@@ -8,12 +8,10 @@ A fundamental challenge in landscape ecology is **how to transfer ecological inf
 
 This framework is a Python code library developed as a small research project within the [Flow-MER project](https://www.flow-mer.org.au/).
 
-The framework enables users to:
+The framework is used to:
 
 - Aggregate fine-resolution ecological data to larger, management-relevant scales  
-- Maintain ecological meaning through appropriate weighting schemes  
-- Handle complex spatial hierarchies common in landscape ecology  
-- Ensure statistical rigor in the calculation of weighted metrics that summarize larger areas from smaller-scale building blocks
+- Facilitate repeatability in the calculation of weighted metrics that summarize larger areas from smaller-scale building blocks
 
 ---
 
@@ -21,14 +19,14 @@ The framework enables users to:
 
 In landscape ecology, **scale** refers to both the spatial extent (how large an area) and the resolution (how fine the detail) of ecological observations.
 
-Ecological systems often exhibit **hierarchical organization**, where smaller units nest within larger ones:
+Ecological systems often exhibit hierarchical organization, where smaller units nest within larger ones:
 
 ```text
 Individual Wetlands → River Reaches → Sub-catchments → Catchments → Bioregions
     (Fine scale)                                                    (Broad scale)
 ```
 
-Issues of scale complicate the study and management of natural systems because:
+Issues of scale complicate the study and management of natural systems where:
 
 1. **Ecological processes operate at multiple scales simultaneously**
    - Individual organisms respond to local habitat conditions
@@ -53,13 +51,9 @@ Simple averaging of fine-scale data can be ecologically misleading due to:
 3. **Spatial autocorrelation**: Nearby observations are not independent
 4. **Edge effects**: Boundaries between management units may not reflect ecological boundaries
 
-## This Framework
-
 The framework uses spatial datasets (e.g., shapefiles or GeoPackages) to model spatial relationships (e.g., smaller patches within larger regions). Data attached to the smallest-scale features (the "building blocks") are then scaled up using spatial joins and weighted averages.
 
 Hierarchical aggregation can occur stepwise: e.g., wetlands → catchments → entire river basin.
-
-### Metric aggregation
 
 Metric aggregation uses a `weighted mean formula`  in several configurations.
 
@@ -74,6 +68,24 @@ Metric aggregation uses a `weighted mean formula`  in several configurations.
         - Frequency-weighted: Weight_i = Frequency_i / Total_frequency
 ```
 
+## This Framework
+
+
+### 1. Data Loading and Validation
+
+- Supports Shapefile and GeoPackage to represent spatial scales
+- Geometry validation and repair
+- Customizable intersection rules (e.g., intersects, within, contains)
+- Load tabular data (CSV) in wide or long format to join with spatial entities
+
+### 2. Functional Group Classification
+
+- A reclassification dictionary can be applied to re-group the data. e.g. different types of forest becomes 'trees', or lakes, swamps and marshes could be grouped to a single 'wetland' class
+- Handles variations in naming conventions across datasets
+- Maintains traceability of classification decisions
+
+### 3. Aggregation
+
 | Method | Use Case | Weighting | Example |
 |--------|----------|-----------|---------|
 | `area_weighted` | Habitat metrics | Polygon area | Wetland or vegetation condition scores — larger habitats contribute more|
@@ -82,26 +94,15 @@ Metric aggregation uses a `weighted mean formula`  in several configurations.
 | `sum` | Additive quantities | None | Measures like abundance, risk, or conservation priority |
 | `frequency_weighted` | Compositional data | Type frequency | Diversity of habitat types or management actions|
 
-### Data Loading and Validation
-
-- Supports Shapefile and GeoPackage to represent spatial scales
-- Geometry validation and repair
-- Customizable intersection rules (e.g., intersects, within, contains)
-- Load tabular data (CSV) in wide or long format to join with spatial entities
-
-### 3. Functional Group Classification
-
-- A reclassification dictionary can be applied to re-group the data. e.g. different types of forest becomes 'trees', or lakes, swamps and marshes could be grouped to a single 'wetland' class
-- Handles variations in naming conventions across datasets
-- Maintains traceability of classification decisions
-
 ### 4. Visualization and Reporting
 
 - some simple helper routines are provided to visualise scale boundary relationships and metric values across scales.
 
+### 5.  Export results to CSV, shapefile or GeoPackage
+
 ## Quick Start
 
-refer included jupyter notebooks.
+Follow the included jupyter notebook.
 
 `test_framework.ipynb`
 
