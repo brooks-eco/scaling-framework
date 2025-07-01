@@ -75,6 +75,240 @@ from shapely.validation import make_valid, explain_validity
 from pyproj import CRS
 
 
+def draw_plot(
+    df,
+    scale_object_name: str = None,
+    unique_id_fields: str = None,
+    group_by: str = None,
+    filter: dict[str] = None,
+    fields: str = None,
+    max_groups: int = 10,
+    vmin=None,
+    vmax=None,
+    total_bounds=False,
+):
+    """
+    Plot one wetland across all years. Each subplot shows one year's
+    data for the selected wetland.
+
+    Args:
+        wetland (str): Wetland identifier.
+        vmin (float, optional): Minimum value for color scale.
+        vmax (float, optional): Maximum value for color scale.
+        total_bounds (bool): If True, fix extent for all plots to total bounds.
+    """
+    # debug print args
+
+    print(f"unique_id_fields: {unique_id_fields}")
+    print(f"group_by: {group_by}")
+    print(f"filter: {filter}")
+
+    def _filter_df(df, conditions):
+        """
+        Filter a DataFrame using case-insensitive substring matches across multiple columns.
+
+        Args:
+            df (pd.DataFrame): The DataFrame to filter.
+            conditions (dict): Dictionary of column-value pairs for substring search.
+
+        Returns:
+            pd.DataFrame: Filtered DataFrame matching all conditions.
+        """
+        mask = pd.Series(True, index=df.index)
+
+        for col, val in conditions.items():
+            if col not in df.columns:
+                print(
+                    f"u26a0 Warning: Column '{col}' not found in DataFrame. List {df.columns.tolist()}] "
+                )
+                mask &= False  # force no matches
+                continue
+
+            match_mask = df[col].astype(str).str.contains(val, case=False, na=False)
+            if not match_mask.any():
+                print(
+                    f"No matches found for '{val}' in column '{col}'."
+                    f"Available values List {df[col].unique().tolist()}]"
+                )
+            else:
+                print(
+                    f"filter: {match_mask.sum()} match(es) found for '{val}' in column '{col}'."
+                )
+
+            mask &= match_mask
+
+        filtered_df = df[mask]
+
+        if filtered_df.empty:
+            print("filter: No rows matched all conditions.")
+        else:
+            print(f"filter: {len(filtered_df)} rows matched all conditions.")
+
+        return filtered_df
+
+    def _add_colorbar(fig, axes, cmap, norm, cols, label="Value"):
+        """
+        Add a shared vertical colorbar next to the last column of subplots.
+
+        Args:
+            fig (matplotlib.figure.Figure): The figure object.
+            axes (list): List of subplot axes.
+            cmap: Matplotlib colormap.
+            norm: Normalization used for color mapping.
+            cols (int): Number of columns in subplot layout.
+            label (str): Label for the colorbar.
+        """
+        bbox = axes[0:cols][-1].get_position()
+        cbar_ax = fig.add_axes([bbox.x1 + 0.03, bbox.y0, 0.02, bbox.y1 - bbox.y0])
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm._A = []
+        fig.colorbar(sm, cax=cbar_ax).set_label(label)
+
+    def _normalise_colours(df, fields, vmin=None, vmax=None):
+        """
+        Compute color normalization and colormap for plotting.
+
+        Args:
+            df (pd.DataFrame): Data to compute normalization from.
+            fields (str or list): Column(s) to compute vmin/vmax from.
+            vmin (float, optional): Override minimum value.
+            vmax (float, optional): Override maximum value.
+
+        Returns:
+            tuple: (colormap, normalization)
+        """
+        if isinstance(fields, str):
+            data = df[fields]
+        else:
+            data = df[fields].stack()
+        vmin = vmin if vmin is not None else data.min()
+        vmax = vmax if vmax is not None else data.max()
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        return plt.cm.viridis, norm
+
+    def _create_subplots(n, cols=3, figsize_per_subplot=5):
+        """
+        Create a grid of subplots based on number of items to plot.
+
+        Args:
+            n (int): Number of plots.
+            cols (int): Number of columns.
+            figsize_per_subplot (int): Width and height per subplot.
+
+        Returns:
+            tuple: (figure, flattened array of axes)
+        """
+        # Adjust columns for small number of plots
+        if n < 3:
+            cols = n
+
+        rows = math.ceil(n / cols)
+        fig, axes = plt.subplots(
+            rows,
+            cols,
+            figsize=(cols * figsize_per_subplot, rows * figsize_per_subplot),
+            constrained_layout=True,
+        )
+
+        # If there's only one subplot, wrap it in a list for consistency
+        axes = [axes] if n == 1 else axes.flatten()
+
+        return fig, axes
+
+    bounds = df.total_bounds if total_bounds else None
+    if filter:
+        df = _filter_df(df, filter)
+        if df.empty:
+            print(f"No data for filter: {filter}")
+            return
+
+    numeric_cols = set(df.select_dtypes(include=[np.number]).columns)
+    valid_cols = numeric_cols - set(group_by or [])
+    if fields is None:
+        fields = list(valid_cols)
+    else:
+        fields = (
+            [str(fields)]
+            if isinstance(fields, (str, int, float))
+            else [str(f) for f in fields]
+        )
+
+    invalid = [f for f in fields if f not in valid_cols]
+    if invalid:
+        raise ValueError(
+            f"Invalid field(s): {invalid}. Valid columns are: {list(valid_cols)}"
+        )
+    print(f"Fields: {fields}")
+
+    # Group info
+    if group_by:
+        excluded = (
+            unique_id_fields[1:] if len(unique_id_fields) > 1 else unique_id_fields
+        )
+        group_fields = [f for f in group_by if f not in excluded]
+
+    # elif type_field and type_field in df.columns:
+    #     group_fields = type_field
+    else:
+        raise ValueError(
+            f"Grouping field not found. Available fields: {df.columns.tolist()}"
+        )
+
+    print(f"Plots are grouped by {group_fields}")
+    # Get unique groups as tuples
+    grouped = df[group_fields].drop_duplicates()
+    # Optional max groups limit
+    groups = [tuple(row) for row in grouped.values]
+    if max_groups is not None:
+        groups = groups[:max_groups]
+
+    for group in groups:
+        # Filter df for this group
+        mask = np.logical_and.reduce(
+            [df[col] == val for col, val in zip(group_fields, group)]
+        )
+        filtered_df = df[mask]
+        # Create label (simple)
+        label = " \n ".join(str(v)[:30] for v in group)
+        if scale_object_name:
+            label = f"{scale_object_name}: " + label
+
+        # normalise the colour range
+        cmap, norm = _normalise_colours(filtered_df, fields, vmin, vmax)
+        # set up the plot
+        fig, axes = _create_subplots(len(fields))
+
+        for i, field in enumerate(fields):
+            ax = axes[i]
+            if total_bounds:
+                ax.set_xlim(bounds[0], bounds[2])
+                ax.set_ylim(bounds[1], bounds[3])
+            filtered_df.plot(
+                column=field,
+                cmap=cmap,
+                norm=norm,
+                ax=ax,
+                edgecolor="blue",
+                legend=False,
+            )
+            ax.set_title(f"{field}")
+            ax.tick_params(
+                axis="both",
+                which="both",
+                length=0,
+                labelbottom=False,
+                labelleft=False,
+            )
+
+        for j in range(i + 1, len(axes)):
+            axes[j].axis("off")
+
+        _add_colorbar(fig, axes, cmap, norm, cols=3, label="Value")
+        filter_label = f"filter = {filter}" if filter else ""
+        plt.suptitle(f"{label}{filter_label}")
+        plt.show()
+
+
 class SpatialScale:
     """
     Represents a single spatial scale in hierarchical ecological analysis.
@@ -207,9 +441,9 @@ class SpatialScale:
 
         # Store unique_id as LIST (convert from string if needed)
         self.unique_id_fields = (
-            [unique_id_fields]
-            if isinstance(unique_id_fields, str)
-            else unique_id_fields
+            [str(unique_id_fields)]
+            if isinstance(unique_id_fields, (str, int, float))
+            else [str(f) for f in unique_id_fields]
         )
 
         # =====================================================================
@@ -354,12 +588,12 @@ class SpatialScale:
             self.data[weighting_field] *= measure_multiplier
 
         self.metric_fields = metric_fields or []  # Metrics available for aggregation
-        self.weighting_field = (
-            weighting_field  # Field used for weighting (area, length, etc.)
-        )
-        self.type_field = (
-            type_field  # Optional field for type-based grouping/reclassification
-        )
+        self.weighting_field = str(
+            weighting_field
+        )  # Field used for weighting (area, length, etc.)
+        self.type_field = str(
+            type_field
+        )  # Optional field for type-based grouping/reclassification
 
         # Centralized validation of metrics and UID uniqueness
         self.data = self._validate_metric_data(
@@ -565,26 +799,25 @@ class SpatialScale:
             source_cols = set(self.data.columns) - {"geometry"}
             target_cols = set(target_scale.data.columns) - {"geometry"}
             conflicting = source_cols & target_cols
-            rename_map = {col: f"{col}_target" for col in conflicting}
-
-            if rename_map:
+            if conflicting:
+                rename_map = {col: f"{col}_target" for col in conflicting}
                 print(
                     f"\u26a0 Warning: Renaming {len(rename_map)} conflicting columns in target scale: {rename_map}"
                 )
                 target_scale.data = target_scale.data.rename(columns=rename_map)
 
-            # Update target's unique_id fields (noting uid is a list) if renamed
-            # Handle compound key (list of fields)
-            updated_uids = [
-                rename_map.get(uid, uid) for uid in target_scale.unique_id_fields
-            ]
+                # Update target's unique_id fields (noting uid is a list) if renamed
+                # Handle compound key (list of fields)
+                updated_uids = [
+                    rename_map.get(uid, uid) for uid in target_scale.unique_id_fields
+                ]
 
-            # If any field was renamed, update the unique_id_field
-            if updated_uids != target_scale.unique_id_fields:
-                target_scale.unique_id_fields = updated_uids
-                print(
-                    f"\u26a0 Warning: Updated target scale unique_id_field to '{updated_uids}'"
-                )
+                # If any field was renamed, update the unique_id_field
+                if updated_uids != target_scale.unique_id_fields:
+                    target_scale.unique_id_fields = updated_uids
+                    print(
+                        f"\u26a0 Warning: Updated target scale unique_id_field to '{updated_uids}'"
+                    )
 
             # Run the spatial join (inner join only, to maintain overlaps)
             joined = gpd.sjoin(self.data, target_scale.data, how="inner", predicate=how)
@@ -600,7 +833,7 @@ class SpatialScale:
         df: pd.DataFrame,
         reclass_map: dict,
         keep_unmatched_types: bool = True,
-        new_class_field: str = "regrouped",
+        new_class_field: str = "reclass_map",
     ) -> tuple[pd.DataFrame, str]:
         """
         Apply functional group reclassification using substring matching.
@@ -668,7 +901,7 @@ class SpatialScale:
         # return original data unchanged. This allows the same aggregation
         # code to work with and without functional grouping.
         if not reclass_map or not self.type_field:
-            return df, self.type_field
+            return df, None
 
         # =====================================================================
         # INITIALIZE RECLASSIFICATION PROCESS
@@ -761,7 +994,7 @@ class SpatialScale:
         )
 
         print(
-            f"\nClassification mapping applied: '{self.type_field}' → '{new_class_field}'"
+            f"\nClassification mapping applied: '{self.type_field}' -> '{new_class_field}'"
         )
         print("=" * 60)
 
@@ -775,7 +1008,7 @@ class SpatialScale:
         for _, row in mapping.iterrows():
             original = f"'{row[self.type_field]}'"
             classified = f"'{row[new_class_field]}'"
-            print(f"  {original.ljust(max_width + 3)} → {classified}")
+            print(f"  {original.ljust(max_width + 3)} -> {classified}")
 
         print(f"\nTotal unique types: {len(mapping)}")
         print(f"Functional groups created: {mapping[new_class_field].nunique()}")
@@ -795,7 +1028,7 @@ class SpatialScale:
         metric_columns: list[str],
         method: str = "weighted_mean",
         reclass_map: dict[str, str] = None,
-        new_class_field: str = "regrouped",
+        new_class_field: str = "reclass_map",
         group_by: list[str] = None,
         keep_unmatched_types: bool = True,
         weighting_field: Optional[str] = None,
@@ -1127,7 +1360,7 @@ class SpatialScale:
         weighting_field: Optional[str] = None,
         group_by: list[str] = None,
         reclass_map: dict[str, str] = None,
-        new_class_field: str = "regrouped",
+        new_class_field: str = "reclass_map",
         keep_unmatched_types: bool = True,
         result_name: str = None,
     ) -> GeoDataFrame:
@@ -1260,6 +1493,8 @@ class SpatialScale:
 
         metric_columns = [str(col) for col in metric_columns]
 
+        group_by = [group_by] if isinstance(group_by, str) else group_by
+
         # Validate metric columns in this scale
         self._validate_metric_data(
             self.data,
@@ -1316,7 +1551,6 @@ class SpatialScale:
         if output_folder == "list":
             print("Available results:")
             for result_name, result_obj in self.results.items():
-                # group_by = [f for f in group_keys if f not in self.unique_id_fields]
                 print(
                     f"  {result_name.ljust(30)} - scaled from: '{result_obj.from_scale_name}' to {result_obj.parent.name} with grouping: {result_obj.group_by} - {str(len(result_obj.data)).rjust(10)} rows {result_obj.data.columns.tolist()}"
                 )
@@ -1533,13 +1767,16 @@ class SpatialScale:
 
     def plot(
         self,
+        geom: bool = False,
         result: str = None,
-        field: str = None,
+        filter: dict[str] = None,
+        fields: Union[str, list] = None,
         reclass_map: dict = None,
-        reclass_field: str = "regrouped",  # this is the default can be over-ridden when applying the reclass_map
+        # reclass_field: str = "reclass_map",  # this is the default can be over-ridden when applying the reclass_map
+        max_groups: int = 10,
         vmin: float = None,
         vmax: float = None,
-        title: str = None,
+        full_extent: bool = False,
     ) -> None:
         """
         Plot the base scale spatial data.
@@ -1549,122 +1786,44 @@ class SpatialScale:
             title: Optional title for the plot
         """
 
-        print(f"Plotting {self.name}...")
-        if result:
-            # result = result.lower()
-            if result not in self.results.keys():
-                print(
-                    f"Result not found. Using {self.name} data. Saved results are {list(self.results.keys())}"
-                )
-                df = self.data
-            else:
-                print(f"Using save result: {result}")
-                result_obj = self.results[result]
-                # results are saved without geometry for efficiency.  So now re-attach the geometry
-                geometry_df = self.data[self.unique_id_fields + ["geometry"]]
-                df = geometry_df.merge(
-                    result_obj.data, on=self.unique_id_fields, how="left"
-                )
-            result_grouping = result_obj.group_by
-        else:
-            df = self.data
+        if result and self.results[result]:
+            return self.results[result].plot(
+                filter, fields, max_groups, vmin, vmax, total_bounds=True
+            )
 
+        print(f"Plotting {self.name}...")
+        df = self.data
+        reclass_field = self.type_field
         if reclass_map:
             df, reclass_field = self._apply_reclassification(
                 df, reclass_map, keep_unmatched_types=False
             )
 
-        if field is None or field not in df.columns:
-            if field is not None:
-                print(
-                    f"Field '{field}' not found in data. "
-                    f"Available fields: {df.columns.tolist()}"
-                )
-            ax = self.data.plot(color="lightblue", edgecolor="blue")
-            ax.set_title(f"Base Scale: {self.name}")
+        if fields is None:
+            ax = self.data.plot(column=reclass_field or self.type_field, legend=True)
+            #  color="lightblue", edgecolor="blue")
+            # Move the legend to the upper left
+            legend = ax.get_legend()
+            if legend:
+                legend.set_bbox_to_anchor((0, 1))  # x=0 (left), y=1 (top)
+                legend.set_loc("upper left")
+            ax.set_title(f"{self.name}")
             ax.axis("off")
+            plt.show()
         else:
-            # Color scale settings
-            vmin = vmin or df[field].min()
-            vmax = vmax or df[field].max()
-            cmap = plt.cm.viridis
-            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
-            # Group info
-            if reclass_field and reclass_field in df.columns:
-                grp = df[reclass_field]
-            elif result_grouping:
-                # No grouping field available, create single group
-                # grp = pd.Series(['All'] * len(df), index=df.index)
-                type_field = [
-                    f for f in result_grouping if f not in self.unique_id_fields
-                ]
-                grp = df[type_field[0]]
-                print(f"grouped by: {type_field}")
-            elif self.type_field and self.type_field in df.columns:
-                grp = df[self.type_field]
-            else:
-                raise ValueError(
-                    f"Grouping field not found. Available fields: {df.columns.tolist()}"
-                )
-
-            # groups = grp.dropna().unique() if grp is not None else ["All"]
-            groups = grp.unique()
-            n_groups = len(groups)
-            cols = 3
-            rows = math.ceil(n_groups / cols)
-
-            # Create subplots
-            fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows))
-            axes = axes.flatten()
-
-            # Store axis and group info for title-setting step
-            plotted_axes = []
-
-            # Plot each group
-            for i, group in enumerate(groups):
-                ax = axes[i]
-
-                # Set axis to base extent
-                bounds = df.total_bounds
-                ax.set_xlim(bounds[0], bounds[2])
-                ax.set_ylim(bounds[1], bounds[3])
-
-                filtered_result = df[grp == group]
-                filtered_result.plot(
-                    column=field,
-                    cmap=cmap,
-                    norm=norm,
-                    ax=ax,
-                    edgecolor="blue",
-                    legend=False,
-                )
-                ax.set_title(f"{self.name} - {group}")
-                # ax.axis("off")
-                # keep the axes as a bounding box but hide the tickmarks and labels
-                ax.tick_params(
-                    axis="both",
-                    which="both",
-                    length=0,
-                    labelbottom=False,
-                    labelleft=False,
-                )
-                plotted_axes.append((ax, group))
-
-            # Turn off unused axes
-            for j in range(i + 1, len(axes)):
-                axes[j].axis("off")
-
-            # Shared vertical colorbar next to first row
-            first_row_axes = axes[0:cols]
-            bbox = first_row_axes[-1].get_position()
-            cbar_ax = fig.add_axes([bbox.x1 + 0.01, bbox.y0, 0.01, bbox.y1 - bbox.y0])
-            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-            sm._A = []
-            cbar = fig.colorbar(sm, cax=cbar_ax)
-            cbar.set_label(field)
-
-        plt.show()
+            # don't know which fields are metric fields so leave empty if not defined
+            draw_plot(
+                self.data,
+                scale_object_name=self.name,
+                filter=filter,
+                unique_id_fields=self.unique_id_fields,
+                group_by=self.unique_id_fields + [reclass_field],
+                fields=fields,
+                max_groups=max_groups,
+                vmin=vmin,
+                vmax=vmax,
+                total_bounds=full_extent,
+            )
 
     class Result:
         """
@@ -1775,6 +1934,51 @@ class SpatialScale:
                         result_df.to_file(out_file, driver="GPKG")
                     if ext == f".shp":
                         result_df.to_file(out_file, driver="ESRI Shapefile")
+
+        def plot(
+            self,
+            filter: dict[str] = None,
+            fields: str = None,
+            max_groups: int = 10,
+            vmin=None,
+            vmax=None,
+            full_extent=False,
+        ) -> None:
+            """
+            Plot one wetland across all years. Each subplot shows one year's
+            data for the selected wetland.
+
+            Args:
+                wetland (str): Wetland identifier.
+                vmin (float, optional): Minimum value for color scale.
+                vmax (float, optional): Maximum value for color scale.
+                total_bounds (bool): If True, fix extent for all plots to total bounds.
+            """
+            geometry_df = self.parent.data[self.parent.unique_id_fields + ["geometry"]]
+            df = geometry_df.merge(
+                self.data, on=self.parent.unique_id_fields, how="left"
+            )
+            if not fields:
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                # in a scaling Result.data we know the numeric fields are our metrics of interest
+                fields = [
+                    f
+                    for f in df.columns
+                    if f not in self.group_by and f in numeric_cols
+                ]
+
+            draw_plot(
+                df,
+                scale_object_name=self.parent.name,
+                filter=filter,
+                unique_id_fields=self.parent.unique_id_fields,
+                group_by=self.group_by,
+                fields=fields,
+                max_groups=max_groups,
+                vmin=vmin,
+                vmax=vmax,
+                total_bounds=full_extent,
+            )
 
 
 def plot_spatial_hierarchy(*args: SpatialScale) -> None:
