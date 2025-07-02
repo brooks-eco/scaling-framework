@@ -304,7 +304,7 @@ def draw_plot(
             axes[j].axis("off")
 
         _add_colorbar(fig, axes, cmap, norm, cols=3, label="Value")
-        filter_label = f"filter = {filter}" if filter else ""
+        filter_label = f": filter = {filter}" if filter else ""
         plt.suptitle(f"{label}{filter_label}")
         plt.show()
 
@@ -372,6 +372,7 @@ class SpatialScale:
         type_field: Optional[str] = None,
         default_crs: str = None,
         is_base_scale: bool = False,
+        data: GeoDataFrame = None,
     ):
         """
         Initialize a spatial scale for hierarchical ecological analysis.
@@ -429,22 +430,15 @@ class SpatialScale:
             ... )
         """
         self.name = name
-        self.source = Path(source)
         self.is_base_scale = is_base_scale
-
-        # Check that the shapefile actually exists
-        if not self.source.exists():
-            raise FileNotFoundError(
-                f"Cannot find shapefile: {source}\n"
-                f"Please check that the file exists and the path is correct."
-            )
-
         # Store unique_id as LIST (convert from string if needed)
         self.unique_id_fields = (
             [str(unique_id_fields)]
             if isinstance(unique_id_fields, (str, int, float))
             else [str(f) for f in unique_id_fields]
         )
+
+        self.source = Path(source)
 
         # =====================================================================
         # STEP 1: DETERMINE REQUIRED COLUMNS FOR EFFICIENT DATA LOADING
@@ -491,17 +485,38 @@ class SpatialScale:
         # =====================================================================
         # STEP 3: LOAD AND VALIDATE SPATIAL DATA
         # =====================================================================
-        # Load spatial data with geometry validation to ensure robust analysis.
-        # Invalid geometries can cause errors in spatial joins and aggregation.
-        self.data = self._validate_geometries(
-            gpd.read_file(self.source).to_crs(self.default_crs), fix_invalid=True
-        )
 
-        # # Convert columns to strings (if not already)
-        # self.data.columns = self.data.columns.map(str) # now in validate_metric_columns
+        # Loading previously aggregated data from a Result class into SpatialScale
+        if isinstance(data, GeoDataFrame):
+            self.data = data
+            # Handle data loaded from a result
+            if type_field == "reclass_map":
+                type_reclass_map, id_reclass_map = (
+                    "type_reclass_map",
+                    "id_reclass_map",
+                )
+                self.data[type_reclass_map] = self.data[type_field]
+                self.data[id_reclass_map] = self.data[type_field]
+                self.unique_id_fields = [
+                    f for f in self.unique_id_fields if f != type_field
+                ] + [id_reclass_map]
+                type_field = type_reclass_map
+                print(
+                    "\u26a0  Warning: Created new type_field 'type_reclass_map' with values of 'reclass_map' to preserve unique ids for future reclass mapping"
+                )
 
-        # # Convert required_cols to strings to match DataFrame columns
-        # required_cols = [str(c) for c in required_cols] # now in validate_metric_columns
+        else:
+            # Load spatial data with geometry validation to ensure robust analysis.
+            # Invalid geometries can cause errors in spatial joins and aggregation.
+            # Check that the shapefile actually exists
+            if not self.source.exists():
+                raise FileNotFoundError(
+                    f"Cannot find shapefile: {source}\n"
+                    f"Please check that the file exists and the path is correct."
+                )
+            self.data = self._validate_geometries(
+                gpd.read_file(self.source).to_crs(self.default_crs), fix_invalid=True
+            )
 
         # Select columns based on whether metric_fields is specified
         if metric_fields:
@@ -591,9 +606,9 @@ class SpatialScale:
         self.weighting_field = str(
             weighting_field
         )  # Field used for weighting (area, length, etc.)
-        self.type_field = str(
-            type_field
-        )  # Optional field for type-based grouping/reclassification
+
+        # Optional field for type-based grouping/reclassification
+        self.type_field = str(type_field)
 
         # Centralized validation of metrics and UID uniqueness
         self.data = self._validate_metric_data(
@@ -603,6 +618,7 @@ class SpatialScale:
             not_allowed=[self.weighting_field, self.type_field],
             set_index=False,
         )
+        # can only check after data is loaded.  reclass_map should only be in data loaded in from a stored result
 
         self.geometry_type = geometry_type
         self._join_cache = {}  # Cached spatial join results
@@ -1978,6 +1994,80 @@ class SpatialScale:
                 vmin=vmin,
                 vmax=vmax,
                 total_bounds=full_extent,
+            )
+
+        def to_scale(
+            self,
+            name: str = None,
+            measure_multiplier: float = None,
+        ) -> 'SpatialScale':
+            """
+            Convert aggregated results back into a new SpatialScale object for further analysis.
+            
+            This method enables multi-step hierarchical aggregation by transforming
+            aggregated results into a new SpatialScale that can be used as input for
+            subsequent scaling operations. This is essential for complex ecological
+            analyses that require multiple levels of aggregation.
+            
+            Ecological Use Cases:
+            - Multi-step aggregation: wetlands → reaches → catchments → bioregions
+            - Cross-scale analysis: comparing patterns at different organizational levels
+            - Iterative refinement: applying different grouping schemes at each scale
+            - Hierarchical modeling: building nested ecological models
+            
+            The method automatically:
+            1. Rejoins aggregated data with spatial geometries from parent scale
+            2. Configures appropriate grouping fields as unique identifiers
+            3. Preserves coordinate reference system and metadata
+            4. Sets up the new scale for further aggregation operations
+            
+            Args:
+                name: Name for the new SpatialScale object. If None, uses current result name
+                measure_multiplier: Optional scaling factor for weight calculations
+                    (e.g., unit conversions for area or length measurements)
+                    
+            Returns:
+                SpatialScale: New SpatialScale object containing aggregated data with geometries,
+                    ready for further analysis or additional aggregation steps
+                    
+            Examples:
+                >>> # Aggregate wetlands to reaches
+                >>> wetland_result = wetlands.aggregate_to(
+                ...     reaches, ['condition_score'], method='area_weighted'
+                ... )
+                
+                >>> # Convert result to new scale for further aggregation
+                >>> reach_scale = wetland_result.to_scale(name='reach_conditions')
+                
+                >>> # Now aggregate reaches to catchments
+                >>> catchment_result = reach_scale.aggregate_to(
+                ...     catchments, ['condition_score_arewm'], method='area_weighted'
+                ... )
+                
+            Notes:
+                - Preserves all aggregated metrics for subsequent analysis
+                - Maintains spatial relationships through geometry preservation
+                - Enables complex multi-level ecological assessments
+                - Supports iterative scaling workflows common in landscape ecology
+            """
+            geometry_df = self.parent.data[self.parent.unique_id_fields + ["geometry"]]
+            df = geometry_df.merge(
+                self.data, on=self.parent.unique_id_fields, how="left"
+            )
+            # Create new SpatialScale from aggregated results
+            return SpatialScale(
+                name=name or self.name,
+                source=f"Scaling_Result_{name}",
+                unique_id_fields=self.group_by,
+                type_field=(
+                    self.parent.type_field
+                    if self.parent.type_field in self.group_by
+                    else list(set(self.group_by) - set(self.parent.unique_id_fields))[0]
+                ),
+                measure_multiplier=measure_multiplier,
+                default_crs=self.parent.default_crs or None,
+                is_base_scale=False,
+                data=df,
             )
 
 
