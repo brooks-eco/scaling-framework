@@ -51,7 +51,7 @@ Simple averaging of fine-scale data can be ecologically misleading due to:
 3. **Spatial autocorrelation**: Nearby observations are not independent
 4. **Edge effects**: Boundaries between management units may not reflect ecological boundaries
 
-The framework uses spatial datasets (e.g., shapefiles or GeoPackages) to model spatial relationships (e.g., smaller patches within larger regions). Data attached to the smallest-scale features (the "building blocks") are then scaled up using spatial joins and weighted averages.
+The framework is a python class to codify a nested hierarchy of spatial data (e.g., shapefiles or GeoPackages defining smaller patches within larger regions). Data attached to the smallest-scale features (the atomic "building blocks") are then up-scaled up using spatial joins and weightings that are relevant ecologically.
 
 Hierarchical aggregation can occur stepwise: e.g., wetlands → catchments → entire river basin.
 
@@ -68,8 +68,7 @@ Metric aggregation uses a `weighted mean formula`  in several configurations.
         - Frequency-weighted: Weight_i = Frequency_i / Total_frequency
 ```
 
-## This Framework
-
+## Features
 
 ### 1. Data Loading and Validation
 
