@@ -98,7 +98,13 @@ Metric aggregation uses a `weighted mean formula`  in several configurations.
 
 - some simple helper routines are provided to visualise scale boundary relationships and metric values across scales.
 
+e.g. plotting the test data hierarchy shows the 4x rectangular "base-scale" polygons that are located within 2 x "regions" that are themselves located within a larger rectangle representing a river "Basin"
+
+![test_hierarchy picture](test_hierarchy.png)
+
 ### 5.  Export results to CSV, shapefile or GeoPackage
+
+- metrics associated with base-scale objects are "up-scaled" e.g. as area/length weighted averages and joined to the larger polygon features they represent and can be saved as ESRI shapefiles or open-source geopackages (the latter having an advantage of not truncating long column headers).
 
 ## Quick Start
 
